@@ -1,0 +1,153 @@
+#version 460
+// Milestone 1: spectral unidirectional path tracer (ray queries, no NEE, no ReSTIR yet).
+// Mirror of the transport logic is tested on CPU in tests/transport_test.cpp.
+#extension GL_EXT_ray_query : require
+#extension GL_GOOGLE_include_directive : enable
+#include "spectral.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
+layout(set = 0, binding = 1, std430) buffer Accum { vec4 accum[]; };
+layout(set = 0, binding = 2, std430) readonly buffer Verts { vec4 verts[]; };
+layout(set = 0, binding = 3, std430) readonly buffer Idx { uint indices[]; };
+layout(set = 0, binding = 4, std430) readonly buffer Mats { uint primMat[]; };
+layout(push_constant) uniform PC { uint width; uint height; uint frame; uint mode; } pc;
+
+const uint  MAT_DIFFUSE = 0u, MAT_EMISSIVE = 1u, MAT_GLASS = 2u;
+const int   MAX_DEPTH = 32;
+const float EPS = 1e-3;
+const float DIFFUSE_ALBEDO = 0.6;   // spectrally flat for now
+const float EMISSION = 12.0;        // spectrally flat for now
+const float PI = 3.14159265358979;
+
+// ---- RNG (PCG) --------------------------------------------------------------
+uint pcg(inout uint s) {
+  s = s * 747796405u + 2891336037u;
+  uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+  return (w >> 22u) ^ w;
+}
+float rnd(inout uint s) { return float(pcg(s) >> 8) * (1.0 / 16777216.0); }
+
+// ---- Geometry ---------------------------------------------------------------
+struct Hit { bool hit; float t; vec3 n; uint prim; };
+
+Hit traceRay(vec3 o, vec3 d) {
+  rayQueryEXT rq;
+  rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, o, 0.0, d, 1e30);
+  while (rayQueryProceedEXT(rq)) {}
+  Hit h;
+  h.hit = rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+  h.t = 0.0; h.n = vec3(0.0); h.prim = 0u;
+  if (h.hit) {
+    h.t = rayQueryGetIntersectionTEXT(rq, true);
+    h.prim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+    vec3 a = verts[indices[3u * h.prim + 0u]].xyz;
+    vec3 b = verts[indices[3u * h.prim + 1u]].xyz;
+    vec3 c = verts[indices[3u * h.prim + 2u]].xyz;
+    h.n = normalize(cross(b - a, c - a));   // host guarantees outward winding
+  }
+  return h;
+}
+
+vec3 cosineSample(vec3 n, float u1, float u2) {
+  float r = sqrt(u1), phi = 2.0 * PI * u2;
+  vec3 t = normalize(abs(n.x) > 0.9 ? cross(n, vec3(0, 1, 0)) : cross(n, vec3(1, 0, 0)));
+  vec3 b = cross(n, t);
+  return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(0.0, 1.0 - u1)));
+}
+
+// eta = n_t / n_i, cosI >= 0
+float fresnelDielectric(float cosI, float eta) {
+  float sin2T = max(0.0, 1.0 - cosI * cosI) / (eta * eta);
+  if (sin2T >= 1.0) return 1.0;
+  float cosT = sqrt(1.0 - sin2T);
+  float rpar  = (eta * cosI - cosT) / (eta * cosI + cosT);
+  float rperp = (cosI - eta * cosT) / (cosI + eta * cosT);
+  return 0.5 * (rpar * rpar + rperp * rperp);
+}
+
+void main() {
+  uvec2 px = gl_GlobalInvocationID.xy;
+  if (px.x >= pc.width || px.y >= pc.height) return;
+
+  uint seed = (px.x * 1973u + px.y * 9277u + pc.frame * 26699u) | 1u;
+  pcg(seed); pcg(seed);
+
+  // Wavelengths: one random number -> 4 stratified wavelengths.
+  vec4 lambdaPdf;
+  vec4 lambda = sampleHeroWavelengths(rnd(seed), lambdaPdf);
+
+  // Pinhole camera.
+  vec3 eye    = (pc.mode == 0u) ? vec3(0.0, 1.0, 6.0) : vec3(0.0, 2.2, 7.5);
+  vec3 target = vec3(0.0, 0.9, 0.0);
+  vec3 fwd = normalize(target - eye);
+  vec3 right = normalize(cross(fwd, vec3(0, 1, 0)));
+  vec3 up = cross(right, fwd);
+  float jx = rnd(seed), jy = rnd(seed);
+  vec2 uv = ((vec2(px) + vec2(jx, jy)) / vec2(pc.width, pc.height)) * 2.0 - 1.0;
+  float tanHalfFov = tan(radians(40.0) * 0.5);
+  float aspect = float(pc.width) / float(pc.height);
+  vec3 d = normalize(fwd + right * (uv.x * tanHalfFov * aspect) - up * (uv.y * tanHalfFov));
+  vec3 o = eye;
+
+  vec4 thr = vec4(1.0);   // per-wavelength path throughput
+  vec4 L = vec4(0.0);     // per-wavelength radiance
+  bool heroOnly = false;  // set once a dispersive surface is hit
+
+  for (int depth = 0; depth < MAX_DEPTH; ++depth) {
+    Hit h = traceRay(o, d);
+    if (!h.hit) {
+      if (pc.mode == 0u) L += thr;   // furnace: environment radiance = 1 (flat spectrum)
+      break;
+    }
+    uint m = primMat[h.prim];
+    bool front = dot(d, h.n) < 0.0;
+    vec3 nf = front ? h.n : -h.n;
+    vec3 p = o + d * h.t;
+
+    if (m == MAT_EMISSIVE) {
+      if (front) L += thr * EMISSION;
+      break;
+    } else if (m == MAT_DIFFUSE) {
+      thr *= DIFFUSE_ALBEDO;
+      float u1 = rnd(seed), u2 = rnd(seed);
+      d = cosineSample(nf, u1, u2);
+      o = p + nf * EPS;
+    } else {
+      // Dispersive dielectric: companions would diverge, so continue with hero only.
+      heroOnly = true;
+      float nG  = sellmeierIor(GLASS_BK7, lambda.x);
+      float eta = front ? nG : 1.0 / nG;
+      float cosI = dot(-d, nf);
+      float F = fresnelDielectric(cosI, eta);
+      if (rnd(seed) < F) {
+        d = reflect(d, nf);
+        o = p + nf * EPS;
+      } else {
+        d = normalize(refract(d, nf, 1.0 / eta));
+        thr /= (eta * eta);          // radiance scaling (camera-side transport)
+        o = p - nf * EPS;
+      }
+    }
+
+    if (depth >= 3) {                // Russian roulette
+      float tmax = heroOnly ? thr.x : max(max(thr.x, thr.y), max(thr.z, thr.w));
+      float q = clamp(tmax, 0.05, 0.95);
+      if (rnd(seed) >= q) break;
+      thr /= q;
+    }
+  }
+
+  vec3 xyz = vec3(0.0);
+  if (heroOnly) {
+    xyz = L.x * heroOnlyWeight(lambdaPdf) * xyzBar(lambda.x);
+  } else {
+    vec4 w = stratifiedWeights(lambdaPdf);
+    for (int i = 0; i < NUM_LAMBDA; ++i) xyz += w[i] * L[i] * xyzBar(lambda[i]);
+  }
+  if (any(isnan(xyz)) || any(isinf(xyz))) return;
+
+  uint idx = px.y * pc.width + px.x;
+  accum[idx] += vec4(xyz, 1.0);
+}
