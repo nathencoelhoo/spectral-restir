@@ -1,0 +1,4 @@
+build/
+*.spv
+.vscode/
+.idea/
