@@ -1,0 +1,39 @@
+name: CI
+on: [push, pull_request]
+
+jobs:
+  cpu-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Spectral math tests
+        run: g++ -std=c++20 -O2 tests/spectral_test.cpp -o spectral_test && ./spectral_test
+      - name: Transport (glass furnace) tests
+        run: g++ -std=c++20 -O2 tests/transport_test.cpp -o transport_test && ./transport_test
+
+  gpu-furnace-lavapipe:
+    runs-on: ubuntu-latest
+    continue-on-error: true   # GPU code is unproven; don't fail the whole CI yet
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential libvulkan-dev vulkan-tools mesa-vulkan-drivers glslc
+      - name: Show Vulkan device and ray query support
+        run: |
+          vulkaninfo --summary || true
+          vulkaninfo 2>/dev/null | grep -i -E "ray_query|acceleration_structure" || echo "no ray query extensions found"
+      - name: Build (compiles C++ and GLSL)
+        run: |
+          cmake -B build
+          cmake --build build
+      - name: GPU furnace test on CPU Vulkan (lavapipe)
+        run: ./build/sr_render 0 64 64 64 build/pathtrace.spv furnace.ppm
+      - name: Upload image
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: furnace
+          path: furnace.ppm
+          if-no-files-found: ignore
