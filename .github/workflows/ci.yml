@@ -11,29 +11,55 @@ jobs:
       - name: Transport (glass furnace) tests
         run: g++ -std=c++20 -O2 tests/transport_test.cpp -o transport_test && ./transport_test
 
-  gpu-furnace-lavapipe:
+  gpu-lavapipe:
     runs-on: ubuntu-latest
-    continue-on-error: true   # GPU code is unproven; don't fail the whole CI yet
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake build-essential libvulkan-dev vulkan-tools mesa-vulkan-drivers glslc
-      - name: Show Vulkan device and ray query support
-        run: |
-          vulkaninfo --summary || true
-          vulkaninfo 2>/dev/null | grep -i -E "ray_query|acceleration_structure" || echo "no ray query extensions found"
       - name: Build (compiles C++ and GLSL)
         run: |
           cmake -B build
           cmake --build build
-      - name: GPU furnace test on CPU Vulkan (lavapipe)
+      - name: Furnace test (must print PASS)
         run: ./build/sr_render 0 64 64 64 build/pathtrace.spv furnace.ppm
-      - name: Upload image
+      - name: Render prism scene
+        run: ./build/sr_render 1 400 300 256 build/pathtrace.spv prism.ppm
+      - name: Convert images to PNG
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import os, struct, zlib
+          def ppm_to_png(src, dst):
+              data = open(src, 'rb').read()
+              parts, pos = [], 0
+              while len(parts) < 4:                       # magic, width, height, maxval
+                  while data[pos:pos+1].isspace(): pos += 1
+                  start = pos
+                  while not data[pos:pos+1].isspace(): pos += 1
+                  parts.append(data[start:pos])
+              pos += 1
+              w, h = int(parts[1]), int(parts[2])
+              raw = b''.join(b'\x00' + data[pos + y*w*3: pos + (y+1)*w*3] for y in range(h))
+              def chunk(t, d):
+                  c = struct.pack('>I', len(d)) + t + d
+                  return c + struct.pack('>I', zlib.crc32(t + d) & 0xffffffff)
+              png = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)) \
+                    + chunk(b'IDAT', zlib.compress(raw, 9)) + chunk(b'IEND', b'')
+              open(dst, 'wb').write(png)
+          for n in ('furnace', 'prism'):
+              if os.path.exists(n + '.ppm'):
+                  ppm_to_png(n + '.ppm', n + '.png')
+          PY
+      - name: Upload images
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: furnace
-          path: furnace.ppm
+          name: renders
+          path: |
+            furnace.png
+            prism.png
           if-no-files-found: ignore
