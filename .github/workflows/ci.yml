@@ -10,6 +10,8 @@ jobs:
         run: g++ -std=c++20 -O2 tests/spectral_test.cpp -o spectral_test && ./spectral_test
       - name: Transport (glass furnace) tests
         run: g++ -std=c++20 -O2 tests/transport_test.cpp -o transport_test && ./transport_test
+      - name: NEE / MIS tests
+        run: g++ -std=c++20 -O2 tests/nee_test.cpp -o nee_test && ./nee_test
 
   gpu-lavapipe:
     runs-on: ubuntu-latest
@@ -27,7 +29,7 @@ jobs:
       - name: Furnace test (must print PASS)
         run: ./build/sr_render 0 64 64 64 build/pathtrace.spv furnace.ppm
       - name: Render prism scene
-        run: ./build/sr_render 1 400 300 256 build/pathtrace.spv prism.ppm
+        run: ./build/sr_render 1 800 600 1024 build/pathtrace.spv prism.ppm
       - name: Convert images to PNG
         if: always()
         run: |
