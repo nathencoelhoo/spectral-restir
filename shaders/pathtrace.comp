@@ -1,6 +1,8 @@
 #version 460
-// Milestone 1: spectral unidirectional path tracer (ray queries, no NEE, no ReSTIR yet).
-// Mirror of the transport logic is tested on CPU in tests/transport_test.cpp.
+// Spectral unidirectional path tracer with next-event estimation (NEE) and MIS.
+// Milestone 2: NEE on the area light, power-heuristic MIS against BSDF sampling.
+// Glass blocks shadow rays (caustics come only from BSDF-sampled paths, MIS weight 1).
+// The MIS/pdf math is mirrored and tested on CPU in tests/nee_test.cpp.
 #extension GL_EXT_ray_query : require
 #extension GL_GOOGLE_include_directive : enable
 #include "spectral.glsl"
@@ -18,8 +20,18 @@ const uint  MAT_DIFFUSE = 0u, MAT_EMISSIVE = 1u, MAT_GLASS = 2u;
 const int   MAX_DEPTH = 32;
 const float EPS = 1e-3;
 const float DIFFUSE_ALBEDO = 0.6;   // spectrally flat for now
-const float EMISSION = 12.0;        // spectrally flat for now
+const float EMISSION = 12.0;        // luminance of the light (Y)
 const float PI = 3.14159265358979;
+
+// Area light: must match buildScene() in src/render.cpp. Faces down (-y).
+const vec3  LIGHT_MIN  = vec3(-1.5, 4.0, -1.5);
+const vec3  LIGHT_SIZE = vec3(3.0, 0.0, 3.0);
+const float LIGHT_AREA = 9.0;
+
+vec4 lightRadiance(vec4 lambda) {
+  return EMISSION * vec4(whiteLightSpectrum(lambda.x), whiteLightSpectrum(lambda.y),
+                         whiteLightSpectrum(lambda.z), whiteLightSpectrum(lambda.w));
+}
 
 // ---- RNG (PCG) --------------------------------------------------------------
 uint pcg(inout uint s) {
@@ -32,9 +44,9 @@ float rnd(inout uint s) { return float(pcg(s) >> 8) * (1.0 / 16777216.0); }
 // ---- Geometry ---------------------------------------------------------------
 struct Hit { bool hit; float t; vec3 n; uint prim; };
 
-Hit traceRay(vec3 o, vec3 d) {
+Hit traceRay(vec3 o, vec3 d, float tmax) {
   rayQueryEXT rq;
-  rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, o, 0.0, d, 1e30);
+  rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT, 0xFF, o, 0.0, d, tmax);
   while (rayQueryProceedEXT(rq)) {}
   Hit h;
   h.hit = rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
@@ -48,6 +60,15 @@ Hit traceRay(vec3 o, vec3 d) {
     h.n = normalize(cross(b - a, c - a));   // host guarantees outward winding
   }
   return h;
+}
+
+// Any hit before tmax blocks the shadow ray (glass counts as blocking).
+bool occluded(vec3 o, vec3 d, float tmax) {
+  rayQueryEXT rq;
+  rayQueryInitializeEXT(rq, tlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+                        0xFF, o, 0.0, d, tmax);
+  while (rayQueryProceedEXT(rq)) {}
+  return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
 }
 
 vec3 cosineSample(vec3 n, float u1, float u2) {
@@ -95,8 +116,11 @@ void main() {
   vec4 L = vec4(0.0);     // per-wavelength radiance
   bool heroOnly = false;  // set once a dispersive surface is hit
 
+  bool  prevSpecular = true;   // camera ray / glass: no MIS (NEE cannot generate these paths)
+  float prevBsdfPdf = 0.0;     // solid-angle pdf of the last diffuse bounce
+
   for (int depth = 0; depth < MAX_DEPTH; ++depth) {
-    Hit h = traceRay(o, d);
+    Hit h = traceRay(o, d, 1e30);
     if (!h.hit) {
       if (pc.mode == 0u) L += thr;   // furnace: environment radiance = 1 (flat spectrum)
       break;
@@ -107,16 +131,44 @@ void main() {
     vec3 p = o + d * h.t;
 
     if (m == MAT_EMISSIVE) {
-      if (front) L += thr * EMISSION;
+      if (front) {
+        float w = 1.0;
+        if (!prevSpecular) {     // BSDF strategy of the diffuse-vertex MIS pair
+          float cosL = max(-dot(d, h.n), 1e-6);
+          float pl = (h.t * h.t) / (cosL * LIGHT_AREA);   // light-sampling pdf, solid angle
+          w = (prevBsdfPdf * prevBsdfPdf) / (prevBsdfPdf * prevBsdfPdf + pl * pl);
+        }
+        L += thr * lightRadiance(lambda) * w;
+      }
       break;
     } else if (m == MAT_DIFFUSE) {
+      vec3 p0 = p + nf * EPS;
+      if (pc.mode == 1u) {       // NEE: uniformly sample the area light
+        float u1 = rnd(seed), u2 = rnd(seed);
+        vec3 lp = LIGHT_MIN + vec3(u1 * LIGHT_SIZE.x, 0.0, u2 * LIGHT_SIZE.z);
+        vec3 wi = lp - p0;
+        float dist2 = dot(wi, wi);
+        float dist = sqrt(dist2);
+        wi /= dist;
+        float cosS = dot(nf, wi);
+        float cosL = wi.y;       // light normal is (0,-1,0)
+        if (cosS > 0.0 && cosL > 0.0 && !occluded(p0, wi, dist - 0.01)) {
+          float pl = dist2 / (cosL * LIGHT_AREA);   // solid-angle pdf
+          float pb = cosS / PI;                     // BSDF pdf for the same direction
+          float w = (pl * pl) / (pl * pl + pb * pb);
+          L += thr * lightRadiance(lambda) * ((DIFFUSE_ALBEDO / PI) * cosS / pl * w);
+        }
+      }
       thr *= DIFFUSE_ALBEDO;
-      float u1 = rnd(seed), u2 = rnd(seed);
-      d = cosineSample(nf, u1, u2);
-      o = p + nf * EPS;
+      float v1 = rnd(seed), v2 = rnd(seed);
+      d = cosineSample(nf, v1, v2);
+      prevBsdfPdf = max(dot(d, nf), 1e-6) / PI;
+      prevSpecular = false;
+      o = p0;
     } else {
       // Dispersive dielectric: companions would diverge, so continue with hero only.
       heroOnly = true;
+      prevSpecular = true;
       float nG  = sellmeierIor(GLASS_BK7, lambda.x);
       float eta = front ? nG : 1.0 / nG;
       float cosI = dot(-d, nf);

@@ -67,4 +67,15 @@ const Sellmeier GLASS_BK7 = Sellmeier(vec3(1.03961212, 0.231792344, 1.01046945),
                                       vec3(0.00600069867, 0.0200179144, 103.560653));
 const Sellmeier GLASS_FUSED_SILICA = Sellmeier(vec3(0.6961663, 0.4079426, 0.8974794),
                                                vec3(0.00467914826, 0.0135120631, 97.9340025));
+
+// Light spectrum: 6540 K blackbody with a small green bump, scaled so that Y = 1
+// and linear-sRGB white = (1,1,1). A pure blackbody tints magenta in sRGB.
+// (Checked in tests/spectral_test.cpp; replace with a measured D65 table later.)
+float whiteLightSpectrum(float l) {
+  const float C2 = 1.4387769e7;   // nm*K
+  const float T  = 6540.0;
+  float planck = pow(l / 560.0, -5.0) * (exp(C2 / (560.0 * T)) - 1.0) / (exp(C2 / (l * T)) - 1.0);
+  float u = (l - 540.0) / 45.0;
+  return 0.958039 * planck * (1.0 + 0.07 * exp(-0.5 * u * u));
+}
 #endif

@@ -70,6 +70,28 @@ int main() {
   CHECK(std::fabs(n - 1.5168) < 1e-3, "BK7 n(587.56nm) = %.5f", n);
   CHECK(sellmeier(B, C, 450) > sellmeier(B, C, 650), "dispersion: n(450) > n(650)");
 
+
+  // 5. White light spectrum: linear sRGB of the light must be (1,1,1) with Y = 1.
+  {
+    auto planckLight = [](double l) {
+      const double C2 = 1.4387769e7, T = 6540.0;
+      double p = std::pow(l / 560.0, -5.0) * (std::exp(C2 / (560.0 * T)) - 1.0) / (std::exp(C2 / (l * T)) - 1.0);
+      double u = (l - 540.0) / 45.0;
+      return 0.958039 * p * (1.0 + 0.07 * std::exp(-0.5 * u * u));
+    };
+    auto xbar = [](double l) { return 1.056 * lobe(l, 599.8, 37.9, 31.0) + 0.362 * lobe(l, 442.0, 16.0, 26.7) - 0.065 * lobe(l, 501.1, 20.4, 26.2); };
+    auto zbar = [](double l) { return 1.217 * lobe(l, 437.0, 11.8, 36.0) + 0.681 * lobe(l, 459.0, 26.0, 13.8); };
+    double X = 0, Y = 0, Z = 0;
+    for (double l = 360; l < 830; l += 0.01) { double s = planckLight(l); X += xbar(l) * s * 0.01; Y += ybar(l) * s * 0.01; Z += zbar(l) * s * 0.01; }
+    X /= ref; Y /= ref; Z /= ref;   // ref = integral of ybar
+    double R = 3.2404542 * X - 1.5371385 * Y - 0.4985314 * Z;
+    double Gc = -0.9692660 * X + 1.8760108 * Y + 0.0415560 * Z;
+    double Bc = 0.0556434 * X - 0.2040259 * Y + 1.0572252 * Z;
+    CHECK(std::fabs(Y - 1) < 0.005, "light luminance Y = %.4f", Y);
+    CHECK(std::fabs(R - 1) < 0.01 && std::fabs(Gc - 1) < 0.01 && std::fabs(Bc - 1) < 0.01,
+          "light linear sRGB = (%.4f, %.4f, %.4f)", R, Gc, Bc);
+  }
+
   std::printf(fails ? "\n%d test(s) failed\n" : "\nall tests passed\n", fails);
   return fails ? 1 : 0;
 }

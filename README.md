@@ -7,11 +7,10 @@ resamples over **wavelength as part of the path**, so dispersion, prisms, gems,
 and thin films get ReSTIR-level sample reuse instead of falling back to
 brute-force spectral path tracing.
 
-> **Status: milestone 1 written, GPU code not yet compiled.**
-> Verified on CPU: spectral sampling, HWSS estimator, Fresnel, and a glass-sphere
-> furnace test of the transport logic. **Not yet compiled:** `src/render.cpp`,
-> `src/main.cpp`, and the GLSL (written without a Vulkan SDK). Expect small
-> first-build fixes.
+> **Status: milestone 1 done, milestone 2 (NEE + MIS) written.**
+> CI builds everything and passes the GPU furnace test on Mesa's CPU Vulkan driver
+> (lavapipe). Milestone 2 (direct light sampling, white light spectrum) is verified
+> on CPU (`tests/nee_test.cpp`) but its GLSL has not yet run: check the CI result.
 
 ## Related work (read before claiming novelty)
 - Waseda thesis proposing resampling for spectral path tracing (offline-oriented)
@@ -30,7 +29,8 @@ ctest --test-dir build --output-on-failure   # CPU spectral tests
 Needs the Vulkan SDK (headers + `glslc`) and a GPU with ray query support.
 
 ## Roadmap
-1. **Spectral path tracer** (no ReSTIR): HWSS, Sellmeier dispersion, XYZ output, furnace test
+1. **Spectral path tracer** (no ReSTIR): HWSS, Sellmeier dispersion, XYZ output, furnace test (done)
+1b. **NEE + MIS** on the area light, neutral white light spectrum
 2. **Scenes that prove the point**: prism, diamond, thin-film bubble, glass caustics
 3. **ReSTIR DI** in spectral form (baseline)
 4. **ReSTIR PT, RGB-style**: wavelength fixed per pixel/frame (your control group)
@@ -44,6 +44,7 @@ src/main.cpp              Vulkan RT capability probe
 src/render.cpp            headless renderer: BLAS/TLAS, compute dispatch, PPM output
 shaders/pathtrace.comp    spectral path tracer (ray queries, hero wavelengths, dispersion)
 tests/transport_test.cpp  CPU mirror of the transport + glass furnace test
+tests/nee_test.cpp        NEE / BSDF / MIS estimators vs brute-force integration
 shaders/spectral.glsl     HWSS, CIE fit, Sellmeier
 shaders/reservoir.glsl    80-byte spectral reservoir + update/finalize
 tests/spectral_test.cpp   CPU reference: unbiasedness + variance checks
