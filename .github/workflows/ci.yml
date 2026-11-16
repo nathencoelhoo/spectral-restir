@@ -28,8 +28,16 @@ jobs:
           cmake --build build
       - name: Furnace test (must print PASS)
         run: ./build/sr_render 0 64 64 64 build/pathtrace.spv furnace.ppm
-      - name: Render prism scene
+      - name: Render prism scene (800x600, 1024 spp)
         run: ./build/sr_render 1 800 600 1024 build/pathtrace.spv prism.ppm
+      - name: Reference render (NEE+MIS, 8192 spp)
+        run: ./build/sr_render 1 256 192 8192 build/pathtrace.spv ref.ppm ref.pfm 100000
+      - name: Bias check (NEE+MIS vs brute-force path tracing)
+        run: |
+          ./build/sr_render 2 256 192 8192 build/pathtrace.spv bruteforce.ppm bruteforce.pfm 200000
+          ./build/sr_compare ref.pfm bruteforce.pfm 0.02
+      - name: Convergence sweep (RMSE should fall like 1/sqrt(N))
+        run: python3 scripts/convergence.py
       - name: Convert images to PNG
         if: always()
         run: |
@@ -52,7 +60,7 @@ jobs:
               png = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)) \
                     + chunk(b'IDAT', zlib.compress(raw, 9)) + chunk(b'IEND', b'')
               open(dst, 'wb').write(png)
-          for n in ('furnace', 'prism'):
+          for n in ('furnace', 'prism', 'ref', 'bruteforce'):
               if os.path.exists(n + '.ppm'):
                   ppm_to_png(n + '.ppm', n + '.png')
           PY
@@ -64,4 +72,6 @@ jobs:
           path: |
             furnace.png
             prism.png
+            ref.png
+            bruteforce.png
           if-no-files-found: ignore
