@@ -12,6 +12,7 @@ add_executable(transport_test tests/transport_test.cpp)
 add_test(NAME transport COMMAND transport_test)
 add_executable(nee_test tests/nee_test.cpp)
 add_test(NAME nee COMMAND nee_test)
+add_executable(sr_compare tools/compare.cpp)   # RMSE / bias between linear PFM images
 
 # --- Vulkan ray-tracing capability probe ------------------------------------
 find_package(Vulkan)

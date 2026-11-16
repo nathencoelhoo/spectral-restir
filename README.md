@@ -7,10 +7,9 @@ resamples over **wavelength as part of the path**, so dispersion, prisms, gems,
 and thin films get ReSTIR-level sample reuse instead of falling back to
 brute-force spectral path tracing.
 
-> **Status: milestone 1 done, milestone 2 (NEE + MIS) written.**
-> CI builds everything and passes the GPU furnace test on Mesa's CPU Vulkan driver
-> (lavapipe). Milestone 2 (direct light sampling, white light spectrum) is verified
-> on CPU (`tests/nee_test.cpp`) but its GLSL has not yet run: check the CI result.
+> **Status: milestones 1 and 2 done; measurement harness added.**
+> CI builds everything and runs on Mesa's CPU Vulkan driver (lavapipe): furnace test,
+> NEE+MIS render, a bias check against brute-force path tracing, and a convergence sweep.
 
 ## Related work (read before claiming novelty)
 - Waseda thesis proposing resampling for spectral path tracing (offline-oriented)
@@ -28,6 +27,17 @@ ctest --test-dir build --output-on-failure   # CPU spectral tests
 ```
 Needs the Vulkan SDK (headers + `glslc`) and a GPU with ray query support.
 
+## Measuring error
+```
+./build/sr_render 1 256 192 8192 build/pathtrace.spv ref.ppm ref.pfm 100000   # reference (offset seeds)
+./build/sr_render 1 256 192 64   build/pathtrace.spv t.ppm t.pfm 0            # test render
+./build/sr_compare ref.pfm t.pfm                                              # RMSE, relMSE, bias
+python3 scripts/convergence.py                                                # RMSE vs spp, slope check
+```
+Modes: 0 furnace, 1 prism with NEE+MIS, 2 prism brute-force (unbiased reference for mode 1).
+`.pfm` files are linear sRGB; `.ppm` files are tone-mapped (ACES fit) for viewing.
+Always render the reference with a different frame offset than the test, or they share samples.
+
 ## Roadmap
 1. **Spectral path tracer** (no ReSTIR): HWSS, Sellmeier dispersion, XYZ output, furnace test (done)
 1b. **NEE + MIS** on the area light, neutral white light spectrum
@@ -41,7 +51,9 @@ Needs the Vulkan SDK (headers + `glslc`) and a GPU with ray query support.
 ## Layout
 ```
 src/main.cpp              Vulkan RT capability probe
-src/render.cpp            headless renderer: BLAS/TLAS, compute dispatch, PPM output
+src/render.cpp            headless renderer: BLAS/TLAS, compute dispatch, PPM + linear PFM output
+tools/compare.cpp         RMSE / relMSE / bias between two PFM images
+scripts/convergence.py    spp sweep + 1/sqrt(N) slope check (used by CI)
 shaders/pathtrace.comp    spectral path tracer (ray queries, hero wavelengths, dispersion)
 tests/transport_test.cpp  CPU mirror of the transport + glass furnace test
 tests/nee_test.cpp        NEE / BSDF / MIS estimators vs brute-force integration
