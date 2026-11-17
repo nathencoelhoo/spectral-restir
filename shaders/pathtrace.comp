@@ -3,6 +3,8 @@
 // Milestone 2: NEE on the area light, power-heuristic MIS against BSDF sampling.
 // Glass blocks shadow rays (caustics come only from BSDF-sampled paths, MIS weight 1).
 // The MIS/pdf math is mirrored and tested on CPU in tests/nee_test.cpp.
+// Modes: 0 = furnace (glass in white environment), 1 = prism scene with NEE+MIS,
+//        2 = same scene as 1 but brute-force (no NEE): an unbiased reference to test mode 1.
 #extension GL_EXT_ray_query : require
 #extension GL_GOOGLE_include_directive : enable
 #include "spectral.glsl"
@@ -116,6 +118,7 @@ void main() {
   vec4 L = vec4(0.0);     // per-wavelength radiance
   bool heroOnly = false;  // set once a dispersive surface is hit
 
+  bool  useNEE = (pc.mode == 1u);
   bool  prevSpecular = true;   // camera ray / glass: no MIS (NEE cannot generate these paths)
   float prevBsdfPdf = 0.0;     // solid-angle pdf of the last diffuse bounce
 
@@ -133,7 +136,7 @@ void main() {
     if (m == MAT_EMISSIVE) {
       if (front) {
         float w = 1.0;
-        if (!prevSpecular) {     // BSDF strategy of the diffuse-vertex MIS pair
+        if (useNEE && !prevSpecular) {   // BSDF strategy of the diffuse-vertex MIS pair
           float cosL = max(-dot(d, h.n), 1e-6);
           float pl = (h.t * h.t) / (cosL * LIGHT_AREA);   // light-sampling pdf, solid angle
           w = (prevBsdfPdf * prevBsdfPdf) / (prevBsdfPdf * prevBsdfPdf + pl * pl);
@@ -143,7 +146,7 @@ void main() {
       break;
     } else if (m == MAT_DIFFUSE) {
       vec3 p0 = p + nf * EPS;
-      if (pc.mode == 1u) {       // NEE: uniformly sample the area light
+      if (useNEE) {              // NEE: uniformly sample the area light
         float u1 = rnd(seed), u2 = rnd(seed);
         vec3 lp = LIGHT_MIN + vec3(u1 * LIGHT_SIZE.x, 0.0, u2 * LIGHT_SIZE.z);
         vec3 wi = lp - p0;
