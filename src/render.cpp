@@ -1,5 +1,8 @@
 // sr_render: headless Vulkan ray-query renderer (milestone 1).
-// Usage: sr_render <mode 0=furnace|1=prism> <width> <height> <frames> <pathtrace.spv> <out.ppm>
+// Usage: sr_render <mode 0=furnace|1=prism+NEE|2=prism brute-force> <width> <height> <frames>
+//                  <pathtrace.spv> <out.ppm> [raw.pfm|-] [frameOffset]
+// raw.pfm holds linear-sRGB means (no tone map) for error measurement; frameOffset shifts the
+// RNG seeds so independent renders (e.g. reference vs test) never share samples.
 // NOT YET COMPILED against a Vulkan SDK. Expect small fixes on first build.
 // Resources are not freed: the process exits right after rendering.
 #include <vulkan/vulkan.h>
@@ -58,7 +61,7 @@ static Mesh buildScene(int mode) {
   body(v[0], v[1], v[4]); body(v[0], v[4], v[3]);                       // bottom
   body(v[1], v[2], v[5]); body(v[1], v[5], v[4]);                       // right
   body(v[2], v[0], v[3]); body(v[2], v[3], v[5]);                       // left
-  if (mode == 1) {
+  if (mode >= 1) {
     m.quad({-6, 0, -6}, {6, 0, -6}, {6, 0, 6}, {-6, 0, 6}, {0, 1, 0}, MAT_DIFFUSE);     // floor
     m.quad({-1.5f, 4, -1.5f}, {1.5f, 4, -1.5f}, {1.5f, 4, 1.5f}, {-1.5f, 4, 1.5f}, {0, -1, 0}, MAT_EMISSIVE); // light
   }
@@ -139,6 +142,8 @@ int main(int argc, char** argv) {
   uint32_t W = argc > 2 ? std::atoi(argv[2]) : 512, H = argc > 3 ? std::atoi(argv[3]) : 512;
   int frames = argc > 4 ? std::atoi(argv[4]) : 64;
   std::string spvPath = argc > 5 ? argv[5] : "pathtrace.spv", outPath = argc > 6 ? argv[6] : "out.ppm";
+  std::string rawPath = argc > 7 ? argv[7] : "";
+  uint32_t frameOffset = argc > 8 ? uint32_t(std::strtoul(argv[8], nullptr, 10)) : 0;
 
   // Instance + device
   VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.apiVersion = VK_API_VERSION_1_3;
@@ -285,7 +290,7 @@ int main(int argc, char** argv) {
     VK(vkBeginCommandBuffer(cmd, &bgi));
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &set, 0, nullptr);
-    PC pc{W, H, uint32_t(fr), uint32_t(mode)};
+    PC pc{W, H, uint32_t(fr) + frameOffset, uint32_t(mode)};
     vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(cmd, (W + 7) / 8, (H + 7) / 8, 1);
     VK(vkEndCommandBuffer(cmd));
@@ -297,6 +302,7 @@ int main(int argc, char** argv) {
   const float* acc = static_cast<const float*>(abuf.map);
   double sumY = 0, sumY2 = 0; size_t np = size_t(W) * H;
   std::vector<unsigned char> rgb(np * 3);
+  std::vector<float> linear(np * 3);
   for (size_t i = 0; i < np; ++i) {
     double cnt = std::max(1.0f, acc[4 * i + 3]);
     double X = acc[4 * i] / cnt / yInt, Y = acc[4 * i + 1] / cnt / yInt, Z = acc[4 * i + 2] / cnt / yInt;
@@ -305,7 +311,13 @@ int main(int argc, char** argv) {
                     -0.9692660 * X + 1.8760108 * Y + 0.0415560 * Z,
                      0.0556434 * X - 0.2040259 * Y + 1.0572252 * Z};
     for (int c = 0; c < 3; ++c) {
-      double v = std::min(1.0, std::max(0.0, lin[c]));
+      linear[3 * i + c] = float(lin[c]);
+      double v = lin[c];
+      if (mode >= 1) {   // ACES filmic fit (Narkowicz) so the bright floor does not clip
+        v = std::max(0.0, v);
+        v = (v * (2.51 * v + 0.03)) / (v * (2.43 * v + 0.59) + 0.14);
+      }
+      v = std::min(1.0, std::max(0.0, v));
       v = v <= 0.0031308 ? 12.92 * v : 1.055 * std::pow(v, 1 / 2.4) - 0.055;
       rgb[3 * i + c] = (unsigned char)std::lround(v * 255.0);
     }
@@ -315,6 +327,12 @@ int main(int argc, char** argv) {
   double meanY = sumY / np, sd = std::sqrt(std::max(0.0, sumY2 / np - meanY * meanY));
   std::printf("wrote %s | mean Y = %.4f, std over pixels = %.4f\n", outPath.c_str(), meanY, sd);
 
+  if (!rawPath.empty() && rawPath != "-") {   // linear float image for tools/compare.cpp
+    std::ofstream pf(rawPath, std::ios::binary);
+    pf << "PF\n" << W << " " << H << "\n-1.0\n";
+    for (int y = int(H) - 1; y >= 0; --y)
+      pf.write(reinterpret_cast<const char*>(&linear[size_t(y) * W * 3]), std::streamsize(W) * 3 * sizeof(float));
+  }
   if (mode == 0) {   // white-furnace: lossless glass in a flat env must give Y = 1
     bool pass = std::fabs(meanY - 1.0) < 0.02;
     std::printf("furnace test: %s (expect mean Y = 1.0 +/- 0.02)\n", pass ? "PASS" : "FAIL");
