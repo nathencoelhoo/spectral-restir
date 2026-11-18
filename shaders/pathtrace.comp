@@ -42,6 +42,11 @@ uint pcg(inout uint s) {
   return (w >> 22u) ^ w;
 }
 float rnd(inout uint s) { return float(pcg(s) >> 8) * (1.0 / 16777216.0); }
+uint pcgHash(uint v) {
+  uint s = v * 747796405u + 2891336037u;
+  uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+  return (w >> 22u) ^ w;
+}
 
 // ---- Geometry ---------------------------------------------------------------
 struct Hit { bool hit; float t; vec3 n; uint prim; };
@@ -94,8 +99,7 @@ void main() {
   uvec2 px = gl_GlobalInvocationID.xy;
   if (px.x >= pc.width || px.y >= pc.height) return;
 
-  uint seed = (px.x * 1973u + px.y * 9277u + pc.frame * 26699u) | 1u;
-  pcg(seed); pcg(seed);
+  uint seed = pcgHash(px.x + pcgHash(px.y + pcgHash(pc.frame)));   // independent stream per (pixel, frame)
 
   // Wavelengths: one random number -> 4 stratified wavelengths.
   vec4 lambdaPdf;
