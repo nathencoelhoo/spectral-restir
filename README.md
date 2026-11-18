@@ -54,6 +54,7 @@ src/main.cpp              Vulkan RT capability probe
 src/render.cpp            headless renderer: BLAS/TLAS, compute dispatch, PPM + linear PFM output
 tools/compare.cpp         RMSE / relMSE / bias between two PFM images
 scripts/convergence.py    spp sweep + 1/sqrt(N) slope check (used by CI)
+scripts/region_bias.py    per-region (prism / floor) bias z-test, brute-force vs NEE+MIS
 shaders/pathtrace.comp    spectral path tracer (ray queries, hero wavelengths, dispersion)
 tests/transport_test.cpp  CPU mirror of the transport + glass furnace test
 tests/nee_test.cpp        NEE / BSDF / MIS estimators vs brute-force integration
