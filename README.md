@@ -58,6 +58,8 @@ scripts/region_bias.py    per-region (prism / floor) bias z-test, brute-force vs
 shaders/pathtrace.comp    spectral path tracer (ray queries, hero wavelengths, dispersion)
 tests/transport_test.cpp  CPU mirror of the transport + glass furnace test
 tests/nee_test.cpp        NEE / BSDF / MIS estimators vs brute-force integration
+tests/restir_toy_test.cpp CPU toy of ReSTIR reuse for caustic paths (unbiasedness + efficiency, see docs/DESIGN.md)
+experiments/restir_iter_toy.cpp  iterated temporal+spatial reuse experiment (not in CI)
 shaders/spectral.glsl     HWSS, CIE fit, Sellmeier
 shaders/reservoir.glsl    80-byte spectral reservoir + update/finalize
 tests/spectral_test.cpp   CPU reference: unbiasedness + variance checks
