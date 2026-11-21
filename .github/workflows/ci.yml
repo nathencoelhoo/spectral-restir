@@ -44,6 +44,11 @@ jobs:
         run: ./build/sr_render 1 256 192 8192 build/pathtrace.spv ref2.ppm ref2.pfm 300000
       - name: Per-region bias check (prism / near floor / far floor)
         run: python3 scripts/region_bias.py ref.pfm ref2.pfm bruteforce.pfm
+      - name: ReSTIR part 1 (mode 3, candidates only) vs reference
+        run: |
+          ./build/sr_render 3 256 192 8192 build/pathtrace.spv restir.ppm restir.pfm 400000 4
+          ./build/sr_compare ref.pfm restir.pfm 0.02
+          python3 scripts/region_bias.py ref.pfm ref2.pfm restir.pfm "ReSTIR part 1"
       - name: Convergence sweep (RMSE should fall like 1/sqrt(N))
         run: python3 scripts/convergence.py
       - name: Convert images to PNG
@@ -68,7 +73,7 @@ jobs:
               png = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)) \
                     + chunk(b'IDAT', zlib.compress(raw, 9)) + chunk(b'IEND', b'')
               open(dst, 'wb').write(png)
-          for n in ('furnace', 'prism', 'ref', 'bruteforce'):
+          for n in ('furnace', 'prism', 'ref', 'bruteforce', 'restir'):
               if os.path.exists(n + '.ppm'):
                   ppm_to_png(n + '.ppm', n + '.png')
           PY
@@ -82,4 +87,5 @@ jobs:
             prism.png
             ref.png
             bruteforce.png
+            restir.png
           if-no-files-found: ignore
