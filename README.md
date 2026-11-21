@@ -34,7 +34,8 @@ Needs the Vulkan SDK (headers + `glslc`) and a GPU with ray query support.
 ./build/sr_compare ref.pfm t.pfm                                              # RMSE, relMSE, bias
 python3 scripts/convergence.py                                                # RMSE vs spp, slope check
 ```
-Modes: 0 furnace, 1 prism with NEE+MIS, 2 prism brute-force (unbiased reference for mode 1).
+Modes: 0 furnace, 1 prism with NEE+MIS, 2 prism brute-force (unbiased reference for mode 1),
+3 prism with the caustic channel split out and sampled by RIS candidates (ReSTIR part 1; extra arg: candidates).
 `.pfm` files are linear sRGB; `.ppm` files are tone-mapped (ACES fit) for viewing.
 Always render the reference with a different frame offset than the test, or they share samples.
 
