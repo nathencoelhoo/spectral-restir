@@ -1,6 +1,6 @@
 // sr_render: headless Vulkan ray-query renderer (milestone 1).
-// Usage: sr_render <mode 0=furnace|1=prism+NEE|2=prism brute-force> <width> <height> <frames>
-//                  <pathtrace.spv> <out.ppm> [raw.pfm|-] [frameOffset]
+// Usage: sr_render <mode 0=furnace|1=prism+NEE|2=prism brute-force|3=prism+NEE with ReSTIR caustic channel>
+//                  <width> <height> <frames> <pathtrace.spv> <out.ppm> [raw.pfm|-] [frameOffset] [candidates]
 // raw.pfm holds linear-sRGB means (no tone map) for error measurement; frameOffset shifts the
 // RNG seeds so independent renders (e.g. reference vs test) never share samples.
 // NOT YET COMPILED against a Vulkan SDK. Expect small fixes on first build.
@@ -135,7 +135,7 @@ static double yBar(double l) {
   return 0.821 * lobe(l, 568.8, 46.9, 40.5) + 0.286 * lobe(l, 530.9, 16.3, 31.1);
 }
 
-struct PC { uint32_t width, height, frame, mode; };
+struct PC { uint32_t width, height, frame, mode, passId, cands, pad0, pad1; };   // 32 bytes, matches the shader
 
 int main(int argc, char** argv) {
   int mode = argc > 1 ? std::atoi(argv[1]) : 0;
@@ -144,6 +144,7 @@ int main(int argc, char** argv) {
   std::string spvPath = argc > 5 ? argv[5] : "pathtrace.spv", outPath = argc > 6 ? argv[6] : "out.ppm";
   std::string rawPath = argc > 7 ? argv[7] : "";
   uint32_t frameOffset = argc > 8 ? uint32_t(std::strtoul(argv[8], nullptr, 10)) : 0;
+  uint32_t cands = argc > 9 ? uint32_t(std::strtoul(argv[9], nullptr, 10)) : 4;   // ReSTIR candidates per pixel per frame
 
   // Instance + device
   VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.apiVersion = VK_API_VERSION_1_3;
@@ -200,6 +201,9 @@ int main(int argc, char** argv) {
   Buf mbuf = makeBuf(mesh.mat.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT); std::memcpy(mbuf.map, mesh.mat.data(), mesh.mat.size() * 4);
   VkDeviceSize accumBytes = VkDeviceSize(W) * H * 16;
   Buf abuf = makeBuf(accumBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT); std::memset(abuf.map, 0, accumBytes);
+  // ReSTIR caustic channel (mode 3): one 32-byte reservoir and one vec4 primary-hit record per pixel.
+  Buf rbuf = makeBuf(VkDeviceSize(W) * H * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT); std::memset(rbuf.map, 0, size_t(W) * H * 32);
+  Buf gbuf = makeBuf(VkDeviceSize(W) * H * 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT); std::memset(gbuf.map, 0, size_t(W) * H * 16);
 
   // Command pool
   VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -244,14 +248,14 @@ int main(int argc, char** argv) {
   VK(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE)); VK(vkQueueWaitIdle(queue));
 
   // Descriptors
-  VkDescriptorSetLayoutBinding lb[5]{};
+  VkDescriptorSetLayoutBinding lb[7]{};
   lb[0].binding = 0; lb[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
-  for (int i = 1; i < 5; ++i) { lb[i].binding = i; lb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; }
+  for (int i = 1; i < 7; ++i) { lb[i].binding = i; lb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; }
   for (auto& b : lb) { b.descriptorCount = 1; b.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
   VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-  dli.bindingCount = 5; dli.pBindings = lb;
+  dli.bindingCount = 7; dli.pBindings = lb;
   VkDescriptorSetLayout dsl; VK(vkCreateDescriptorSetLayout(gDev, &dli, nullptr, &dsl));
-  VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}};
+  VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6}};
   VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
   dpi.maxSets = 1; dpi.poolSizeCount = 2; dpi.pPoolSizes = ps;
   VkDescriptorPool dpool; VK(vkCreateDescriptorPool(gDev, &dpi, nullptr, &dpool));
@@ -261,12 +265,13 @@ int main(int argc, char** argv) {
 
   VkWriteDescriptorSetAccelerationStructureKHR asw{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
   asw.accelerationStructureCount = 1; asw.pAccelerationStructures = &tlas.h;
-  VkDescriptorBufferInfo bi[4] = {{abuf.b, 0, VK_WHOLE_SIZE}, {vbuf.b, 0, VK_WHOLE_SIZE}, {ibuf.b, 0, VK_WHOLE_SIZE}, {mbuf.b, 0, VK_WHOLE_SIZE}};
-  VkWriteDescriptorSet w[5]{};
-  for (int i = 0; i < 5; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = set; w[i].dstBinding = i; w[i].descriptorCount = 1; }
+  VkDescriptorBufferInfo bi[6] = {{abuf.b, 0, VK_WHOLE_SIZE}, {vbuf.b, 0, VK_WHOLE_SIZE}, {ibuf.b, 0, VK_WHOLE_SIZE}, {mbuf.b, 0, VK_WHOLE_SIZE},
+                                  {rbuf.b, 0, VK_WHOLE_SIZE}, {gbuf.b, 0, VK_WHOLE_SIZE}};
+  VkWriteDescriptorSet w[7]{};
+  for (int i = 0; i < 7; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = set; w[i].dstBinding = i; w[i].descriptorCount = 1; }
   w[0].pNext = &asw; w[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
-  for (int i = 1; i < 5; ++i) { w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bi[i - 1]; }
-  vkUpdateDescriptorSets(gDev, 5, w, 0, nullptr);
+  for (int i = 1; i < 7; ++i) { w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bi[i - 1]; }
+  vkUpdateDescriptorSets(gDev, 7, w, 0, nullptr);
 
   // Pipeline
   std::ifstream f(spvPath, std::ios::binary | std::ios::ate);
@@ -290,7 +295,16 @@ int main(int argc, char** argv) {
     VK(vkBeginCommandBuffer(cmd, &bgi));
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &set, 0, nullptr);
-    PC pc{W, H, uint32_t(fr) + frameOffset, uint32_t(mode)};
+    PC pc{W, H, uint32_t(fr) + frameOffset, uint32_t(mode), 1, cands, 0, 0};
+    if (mode == 3) {   // pass 0: primary hit + candidate generation -> reservoirs; pass 1: shading
+      pc.passId = 0;
+      vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+      vkCmdDispatch(cmd, (W + 7) / 8, (H + 7) / 8, 1);
+      VkMemoryBarrier cbar{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+      cbar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; cbar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+      vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &cbar, 0, nullptr, 0, nullptr);
+      pc.passId = 1;
+    }
     vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(cmd, (W + 7) / 8, (H + 7) / 8, 1);
     VK(vkEndCommandBuffer(cmd));
