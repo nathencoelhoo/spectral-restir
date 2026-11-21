@@ -105,3 +105,18 @@ the static-scene assumption that makes temporal reuse free; blotchy spatial corr
 is not measured; the real renderer has companion wavelengths, Russian roulette and a diffuse floor
 interreflection that the toy leaves out. Not tested: a better shift than random replay (for specular
 chains this means manifold walks, and dispersion makes the solution wavelength dependent).
+
+
+## GPU port: status
+
+**Part 1 (written, awaiting CI): reservoir buffers + candidate pass, no reuse (mode 3).**
+- Pixels whose primary hit is the diffuse floor split their light exactly into a *base* estimate (all
+  paths except x -> 1..8 glass vertices -> light) and a *caustic channel* (exactly those paths).
+- Pass 0 draws N0 replay seeds per pixel, evaluates each with evalCaustic() (mirrors the toy's evalPath),
+  RIS-selects one and stores (seed, W, M, p_hat, f) in a 32-byte reservoir. Pass 1 shades: base path
+  tracer (which skips precisely the events evalCaustic counts) + f * W.
+- Expected result: unbiased, noise like mode 1 (RIS alone has efficiency 1.00x in the toy). It exists
+  to prove the plumbing: if mode 3 disagrees with mode 1 beyond noise, the split or the replay is wrong.
+- Not yet: temporal/spatial reuse, ping-pong reservoir buffers, pairwise MIS (part 2).
+- Scope limits: the caustic channel only serves pixels that see the floor directly; floor seen through
+  the prism, and chains that start at a later diffuse vertex, stay in the base estimator.
