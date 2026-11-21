@@ -48,7 +48,7 @@ jobs:
         run: |
           ./build/sr_render 3 256 192 8192 build/pathtrace.spv restir.ppm restir.pfm 400000 4
           ./build/sr_compare ref.pfm restir.pfm 0.02
-          python3 scripts/region_bias.py ref.pfm ref2.pfm restir.pfm "ReSTIR part 1"
+          python3 scripts/region_bias.py ref.pfm ref2.pfm restir.pfm
       - name: Convergence sweep (RMSE should fall like 1/sqrt(N))
         run: python3 scripts/convergence.py
       - name: Convert images to PNG
