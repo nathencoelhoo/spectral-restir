@@ -49,6 +49,14 @@ jobs:
           ./build/sr_render 3 256 192 8192 build/pathtrace.spv restir.ppm restir.pfm 400000 4
           ./build/sr_compare ref.pfm restir.pfm 0.02
           python3 scripts/region_bias.py ref.pfm ref2.pfm restir.pfm
+                - name: Negative control (caustic channel disabled must be detected)
+        run: |
+          ./build/sr_render 3 256 192 2048 build/pathtrace.spv neg.ppm neg.pfm 500000 0
+          if python3 scripts/region_bias.py ref.pfm ref2.pfm neg.pfm; then
+            echo "Negative control NOT detected: the bias check is too weak"; exit 1
+          else
+            echo "Negative control detected as expected"
+          fi
       - name: Convergence sweep (RMSE should fall like 1/sqrt(N))
         run: python3 scripts/convergence.py
       - name: Convert images to PNG
