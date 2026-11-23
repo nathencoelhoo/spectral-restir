@@ -120,3 +120,17 @@ chains this means manifold walks, and dispersion makes the solution wavelength d
 - Not yet: temporal/spatial reuse, ping-pong reservoir buffers, pairwise MIS (part 2).
 - Scope limits: the caustic channel only serves pixels that see the floor directly; floor seen through
   the prism, and chains that start at a later diffuse vertex, stay in the base estimator.
+
+**Part 2 (written, awaiting CI): ping-pong reservoirs, temporal and spatial reuse with pairwise MIS.**
+- Reservoir and primary-hit buffers are doubled and flipped by frame parity. Frame passes: 0 candidates,
+  2 reuse (optional), 1 shading. Mode 4 outputs the caustic channel alone so reuse noise can be measured
+  without the base estimator.
+- Reuse (reusePass) mirrors experiments/restir_iter_toy.cpp: canonical = fresh candidates; sources = same
+  pixel last frame (temporal) and 2 random neighbours in a 7x7 window (spatial); pairwise MIS; M capped at 20.
+- Difference from the toy: camera jitter moves each pixel's floor point every frame, so the temporal source
+  must be replayed at the new point (2 evaluations), unlike the toy where it was free.
+- Cost per pixel per frame: candidates + 2 (temporal) + 4 (two spatial). CI compares equal-cost configs
+  (8 evaluations): 8 candidates / 6 + temporal / 2 + temporal + spatial.
+- Statistics: reuse makes noise spatially correlated, which breaks the per-pixel z-test (a synthetic check
+  gave a false FAIL, z = -5.95, with no bias). Reuse tests use REGION_TILE=16 (tiles as independent units).
+  The tile test has less power; its real resolution is to be read off the CI tables, not assumed.
