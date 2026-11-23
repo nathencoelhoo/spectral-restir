@@ -2,7 +2,7 @@
 """Per-region bias test: is `test` (e.g. brute-force path tracing) statistically consistent with
 two independent renders A and B of the reference estimator (NEE+MIS)?
 
-usage: region_bias.py A.pfm B.pfm TEST.pfm
+usage: region_bias.py A.pfm B.pfm TEST.pfm [label]
 
 A whole-image mean can hide a local error (the caustic is a small part of the frame), so this
 compares regions separately. Regions come from the camera geometry in shaders/pathtrace.comp
@@ -12,8 +12,14 @@ compares regions separately. Regions come from the camera geometry in shaders/pa
   floor_far  : rest of the floor (|x|,|z| <= 6)
 Statistics: D = TEST - (A+B)/2 per pixel. z = mean(D) / (std(D)/sqrt(N)). Calibration: z0 from
 A - B, which contains pure noise, so |z0| should be small. FAIL if |z| > 5 and |relative bias| > 0.5%.
+
+Spatially correlated noise (reuse shares samples between neighbours) makes the per-pixel standard error
+too small. Set REGION_TILE=16 to treat 16x16 pixel tiles as the independent units instead (a
+cluster-robust standard error); use it for every reuse test.
 """
 import math, os, struct, sys
+
+TILE = int(os.environ.get("REGION_TILE", "1"))
 
 EYE, TARGET = (0.0, 2.2, 7.5), (0.0, 0.9, 0.0)
 TAN_HALF = math.tan(math.radians(40.0) * 0.5)
@@ -72,8 +78,23 @@ def zstat(diff):
     var = sum((d - m) ** 2 for d in diff) / max(1, n - 1)
     return m, (m / math.sqrt(var / n)) if var > 0 else 0.0
 
+def zstat_tiles(idx, diff, w, tile):
+    """Mean difference and z-score with tiles as clusters (ratio estimator, cluster-robust variance)."""
+    sums, cnts = {}, {}
+    for i, d in zip(idx, diff):
+        t = ((i // w) // tile, (i % w) // tile)
+        sums[t] = sums.get(t, 0.0) + d; cnts[t] = cnts.get(t, 0) + 1
+    n = sum(cnts.values()); m = sum(sums.values()) / n; nt = len(sums)
+    if nt < 3: return m, 0.0
+    var = sum((sums[t] - m * cnts[t]) ** 2 for t in sums) / (n * n) * nt / (nt - 1)
+    return m, (m / math.sqrt(var)) if var > 0 else 0.0
+
+def stat(idx, diff, w):
+    return zstat_tiles(idx, diff, w, TILE) if TILE > 1 else zstat(diff)
+
 def main():
-    if len(sys.argv) != 4: print(__doc__); return 1
+    if len(sys.argv) not in (4, 5): print(__doc__); return 1
+    label = sys.argv[4] if len(sys.argv) == 5 else "brute-force"
     (w, h, A), (w2, h2, B), (w3, h3, T) = (read_pfm(p) for p in sys.argv[1:4])
     assert (w, h) == (w2, h2) == (w3, h3), "size mismatch"
     labels = build_masks(w, h)
@@ -83,8 +104,8 @@ def main():
         if len(idx) < 50: continue
         ref = [(A[i] + B[i]) / 2 for i in idx]; mref = sum(ref) / len(ref)
         mt = sum(T[i] for i in idx) / len(idx)
-        md, z = zstat([T[i] - r for i, r in zip(idx, ref)])
-        _, z0 = zstat([A[i] - B[i] for i in idx])
+        md, z = stat(idx, [T[i] - r for i, r in zip(idx, ref)], w)
+        _, z0 = stat(idx, [A[i] - B[i] for i in idx], w)
         rel = md / mref if mref > 0 else 0.0
         bad = abs(z) > Z_FAIL and abs(rel) > BIAS_FAIL
         fail |= bad
@@ -96,7 +117,7 @@ def main():
     summ = os.environ.get("GITHUB_STEP_SUMMARY")
     if summ:
         with open(summ, "a") as f:
-            f.write("### Per-region bias (brute-force vs NEE+MIS)\n\n| region | pixels | mean ref | mean test | bias | z | null z | verdict |\n|---|---|---|---|---|---|---|---|\n")
+            f.write(f"### Per-region bias ({label} vs NEE+MIS)\n\n| region | pixels | mean ref | mean test | bias | z | null z | verdict |\n|---|---|---|---|---|---|---|---|\n")
             for n, c, mr, mt, rel, z, z0, bad in rows:
                 f.write(f"| {n} | {c} | {mr:.5f} | {mt:.5f} | {rel*100:+.3f}% | {z:.2f} | {z0:.2f} | {'FAIL' if bad else 'ok'} |\n")
             f.write(f"\nFAIL needs |z| > {Z_FAIL} and |bias| > {BIAS_FAIL*100:.1f}%. 'null z' compares A with B (noise only) and should be small.\n")
