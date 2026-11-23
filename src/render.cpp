@@ -1,6 +1,7 @@
 // sr_render: headless Vulkan ray-query renderer (milestone 1).
-// Usage: sr_render <mode 0=furnace|1=prism+NEE|2=prism brute-force|3=prism+NEE with ReSTIR caustic channel>
-//                  <width> <height> <frames> <pathtrace.spv> <out.ppm> [raw.pfm|-] [frameOffset] [candidates]
+// Usage: sr_render <mode 0=furnace|1=prism+NEE|2=prism brute-force|3=prism+NEE with ReSTIR caustic channel|4=caustic channel only>
+//                  <width> <height> <frames> <pathtrace.spv> <out.ppm> [raw.pfm|-] [frameOffset] [candidates] [reuse]
+// reuse: bit 0 = temporal, bit 1 = spatial (modes 3/4)
 // raw.pfm holds linear-sRGB means (no tone map) for error measurement; frameOffset shifts the
 // RNG seeds so independent renders (e.g. reference vs test) never share samples.
 // NOT YET COMPILED against a Vulkan SDK. Expect small fixes on first build.
@@ -135,7 +136,7 @@ static double yBar(double l) {
   return 0.821 * lobe(l, 568.8, 46.9, 40.5) + 0.286 * lobe(l, 530.9, 16.3, 31.1);
 }
 
-struct PC { uint32_t width, height, frame, mode, passId, cands, pad0, pad1; };   // 32 bytes, matches the shader
+struct PC { uint32_t width, height, frame, mode, passId, cands, reuse, pad1; };   // 32 bytes, matches the shader
 
 int main(int argc, char** argv) {
   int mode = argc > 1 ? std::atoi(argv[1]) : 0;
@@ -145,6 +146,7 @@ int main(int argc, char** argv) {
   std::string rawPath = argc > 7 ? argv[7] : "";
   uint32_t frameOffset = argc > 8 ? uint32_t(std::strtoul(argv[8], nullptr, 10)) : 0;
   uint32_t cands = argc > 9 ? uint32_t(std::strtoul(argv[9], nullptr, 10)) : 4;   // ReSTIR candidates per pixel per frame
+  uint32_t reuse = argc > 10 ? uint32_t(std::strtoul(argv[10], nullptr, 10)) : 0;  // reuse bits
 
   // Instance + device
   VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.apiVersion = VK_API_VERSION_1_3;
@@ -202,8 +204,9 @@ int main(int argc, char** argv) {
   VkDeviceSize accumBytes = VkDeviceSize(W) * H * 16;
   Buf abuf = makeBuf(accumBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT); std::memset(abuf.map, 0, accumBytes);
   // ReSTIR caustic channel (mode 3): one 32-byte reservoir and one vec4 primary-hit record per pixel.
-  Buf rbuf = makeBuf(VkDeviceSize(W) * H * 32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT); std::memset(rbuf.map, 0, size_t(W) * H * 32);
-  Buf gbuf = makeBuf(VkDeviceSize(W) * H * 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT); std::memset(gbuf.map, 0, size_t(W) * H * 16);
+  // Two slots each (ping-pong by frame parity): current frame is written, previous frame is read.
+  Buf rbuf = makeBuf(VkDeviceSize(W) * H * 32 * 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT); std::memset(rbuf.map, 0, size_t(W) * H * 32 * 2);
+  Buf gbuf = makeBuf(VkDeviceSize(W) * H * 16 * 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT); std::memset(gbuf.map, 0, size_t(W) * H * 16 * 2);
 
   // Command pool
   VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -295,18 +298,22 @@ int main(int argc, char** argv) {
     VK(vkBeginCommandBuffer(cmd, &bgi));
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &set, 0, nullptr);
-    PC pc{W, H, uint32_t(fr) + frameOffset, uint32_t(mode), 1, cands, 0, 0};
-    if (mode == 3) {   // pass 0: primary hit + candidate generation -> reservoirs; pass 1: shading
-      pc.passId = 0;
+    PC pc{W, H, uint32_t(fr) + frameOffset, uint32_t(mode), 1, cands, reuse, 0};
+    auto runPass = [&](uint32_t passId) {
+      pc.passId = passId;
       vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
       vkCmdDispatch(cmd, (W + 7) / 8, (H + 7) / 8, 1);
+    };
+    auto barrier = [&]() {
       VkMemoryBarrier cbar{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
       cbar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT; cbar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
       vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &cbar, 0, nullptr, 0, nullptr);
-      pc.passId = 1;
+    };
+    if (mode == 3 || mode == 4) {          // pass 0: candidates, pass 2: reuse (optional), pass 1: shading
+      runPass(0); barrier();
+      if (reuse) { runPass(2); barrier(); }
     }
-    vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    vkCmdDispatch(cmd, (W + 7) / 8, (H + 7) / 8, 1);
+    runPass(1);
     VK(vkEndCommandBuffer(cmd));
     VK(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE)); VK(vkQueueWaitIdle(queue));
   }
