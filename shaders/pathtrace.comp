@@ -5,13 +5,17 @@
 // The MIS/pdf math is mirrored and tested on CPU in tests/nee_test.cpp.
 // Modes: 0 = furnace (glass in white environment), 1 = prism scene with NEE+MIS,
 //        2 = same scene as 1 but brute-force (no NEE): an unbiased reference to test mode 1,
-//        3 = mode 1 with the caustic channel split out and estimated by RIS candidates (ReSTIR part 1).
+//        3 = mode 1 with the caustic channel split out and estimated by ReSTIR (candidates, optional reuse),
+//        4 = caustic channel only (measurement: no base estimator, so reuse noise can be read cleanly).
 //
 // Caustic channel (mode 3). For a pixel whose primary hit x is the diffuse floor, the light is split exactly:
 //   base estimate  = everything except paths  x -> 1..CAUSTIC_MAX_GLASS glass vertices -> light
 //   caustic channel = those excluded paths, estimated from random-replay seeds (evalCaustic) via RIS.
 // The base tracer drops precisely the events evalCaustic counts, so base + caustic is unbiased.
-// Pass 0 (candidates) writes one reservoir per pixel; pass 1 shades. Part 2 adds reuse between them.
+// Pass 0 (candidates) writes a fresh reservoir per pixel; pass 2 (reuse, optional) merges it with last
+// frame's reservoirs (temporal: same pixel, spatial: 2 random neighbours) using pairwise MIS; pass 1 shades.
+// Reservoir and primary-hit buffers are ping-ponged by frame parity: slot (frame & 1) is written, the
+// other slot holds the previous frame.
 #extension GL_EXT_ray_query : require
 #extension GL_GOOGLE_include_directive : enable
 #include "spectral.glsl"
@@ -37,7 +41,8 @@ layout(push_constant) uniform PC {
   uint width; uint height; uint frame; uint mode;
   uint passId;   // 0 = candidate pass (mode 3 only), 1 = shading
   uint cands;    // candidates per pixel per frame
-  uint pad0; uint pad1;
+  uint reuse;    // bit 0: temporal reuse, bit 1: spatial reuse (pass 2 runs only if nonzero)
+  uint pad1;
 } pc;
 
 const uint  MAT_DIFFUSE = 0u, MAT_EMISSIVE = 1u, MAT_GLASS = 2u;
@@ -52,6 +57,8 @@ const vec3  LIGHT_MIN  = vec3(-1.5, 4.0, -1.5);
 const vec3  LIGHT_SIZE = vec3(3.0, 0.0, 3.0);
 const float LIGHT_AREA = 9.0;
 const int   CAUSTIC_MAX_GLASS = 8;   // glass interactions handled by the caustic channel
+const float MCAP = 20.0;             // confidence cap for reused reservoirs
+const vec3  FLOOR_N = vec3(0.0, 1.0, 0.0);   // the only diffuse surface in the scene is the horizontal floor
 
 vec4 lightRadiance(vec4 lambda) {
   return EMISSION * vec4(whiteLightSpectrum(lambda.x), whiteLightSpectrum(lambda.y),
@@ -179,6 +186,7 @@ vec3 evalCaustic(vec3 x, vec3 n, uint seed) {
 // Pass 0: find the primary hit; if it is the diffuse floor, draw pc.cands candidate seeds and RIS-select one.
 void candidatePass(uvec2 px) {
   uint idx = px.y * pc.width + px.x;
+  uint cur = (pc.frame & 1u) * (pc.width * pc.height);
   uint seed = pcgHash(px.x + pcgHash(px.y + pcgHash(pc.frame)));
   rnd(seed);                                   // same draw order as pass 1: wavelength, then jitter
   float jx = rnd(seed), jy = rnd(seed);
@@ -206,15 +214,98 @@ void candidatePass(uvec2 px) {
     r.pY = pick;
     r.W = (pick > 0.0) ? wsum / (float(pc.cands) * pick) : 0.0;
   }
-  caustic[idx] = r;
-  gpos[idx] = gp;
+  caustic[cur + idx] = r;
+  gpos[cur + idx] = gp;
+}
+
+// Pass 2: merge this pixel's fresh candidate reservoir (canonical) with last frame's reservoirs using
+// pairwise MIS (Lin et al. 2022). Sources: same pixel (temporal) and 2 random neighbours (spatial).
+// A source's sample is replayed at this pixel (random replay) and the canonical sample is replayed at the
+// source's pixel: 2 evaluations per source. Mirrors the toy in experiments/restir_iter_toy.cpp.
+// Sources are chosen by position validity only (is it a floor pixel?), never by sample content.
+void reusePass(uvec2 px) {
+  uint N = pc.width * pc.height;
+  uint idx = px.y * pc.width + px.x;
+  uint cur = (pc.frame & 1u) * N;
+  uint prev = ((pc.frame + 1u) & 1u) * N;
+  vec4 gq = gpos[cur + idx];
+  if (gq.w < 0.5) return;
+  CausticReservoir cand = caustic[cur + idx];
+  vec3 xq = gq.xyz;
+  uint rs = pcgHash(px.x + pcgHash(px.y + pcgHash(pc.frame ^ 0x5BD1E995u)));
+
+  uint sidx[3];
+  int k = 0;
+  if ((pc.reuse & 1u) != 0u) sidx[k++] = idx;                       // temporal: same pixel, previous frame
+  if ((pc.reuse & 2u) != 0u) {                                      // spatial: 2 distinct random neighbours
+    int got = 0;
+    for (int t = 0; t < 12 && got < 2; ++t) {
+      int ox = int(rnd(rs) * 7.0) - 3, oy = int(rnd(rs) * 7.0) - 3;
+      if (ox == 0 && oy == 0) continue;
+      ivec2 q = ivec2(px) + ivec2(ox, oy);
+      if (q.x < 0 || q.y < 0 || q.x >= int(pc.width) || q.y >= int(pc.height)) continue;
+      uint nidx = uint(q.y) * pc.width + uint(q.x);
+      if (gpos[prev + nidx].w < 0.5) continue;
+      bool dup = false;
+      for (int j = 0; j < k; ++j) if (sidx[j] == nidx) dup = true;
+      if (dup) continue;
+      sidx[k++] = nidx; ++got;
+    }
+  }
+  // the previous-frame slot is all zeros on frame 0 (gpos.w = 0): drop invalid temporal source
+  int kk = 0; uint valid[3];
+  for (int i = 0; i < k; ++i) if (gpos[prev + sidx[i]].w > 0.5) valid[kk++] = sidx[i];
+
+  float Mc = cand.M;
+  float mc = 1.0, tot = Mc, wsum = 0.0;
+  uint bestSeed = cand.seed; vec3 bestF = cand.f.xyz; bool haveBest = false;
+  float invk = 1.0 / float(max(kk, 1));
+  for (int i = 0; i < kk; ++i) {
+    CausticReservoir sr = caustic[prev + valid[i]];
+    vec4 sp = gpos[prev + valid[i]];
+    float sM = min(sr.M, MCAP);
+    tot += sM;
+    float wi = 0.0; vec3 fq = vec3(0.0);
+    if (sr.W > 0.0) {                                               // source holds a sample: replay it here
+      fq = evalCaustic(xq, FLOOR_N, sr.seed);
+      float den = sM * sr.pY + Mc * fq.y;
+      float mi = (den > 0.0) ? invk * sM * sr.pY / den : 0.0;
+      wi = mi * fq.y * sr.W;
+    }
+    float piXc = (cand.pY > 0.0) ? evalCaustic(sp.xyz, FLOOR_N, cand.seed).y : 0.0;   // canonical at source pixel
+    float denc = sM * piXc + Mc * cand.pY;
+    mc -= (denc > 0.0) ? invk * sM * piXc / denc : 0.0;
+    wsum += wi;
+    if (wi > 0.0 && rnd(rs) * wsum < wi) { bestSeed = sr.seed; bestF = fq; haveBest = true; }
+  }
+  float wc = mc * cand.pY * cand.W;
+  wsum += wc;
+  if (wc > 0.0 && rnd(rs) * wsum < wc) { bestSeed = cand.seed; bestF = cand.f.xyz; haveBest = true; }
+
+  CausticReservoir o;
+  o.M = min(tot, MCAP);
+  if (wsum > 0.0 && haveBest) { o.seed = bestSeed; o.f = vec4(bestF, 0.0); o.pY = bestF.y; o.W = wsum / bestF.y; }
+  else                        { o.seed = cand.seed; o.f = vec4(0.0); o.pY = 0.0; o.W = 0.0; }
+  caustic[cur + idx] = o;
 }
 
 void main() {
   uvec2 px = gl_GlobalInvocationID.xy;
   if (px.x >= pc.width || px.y >= pc.height) return;
-  if (pc.passId == 0u) { if (pc.mode == 3u) candidatePass(px); return; }
+  bool restirMode = (pc.mode == 3u || pc.mode == 4u);
+  if (pc.passId == 0u) { if (restirMode) candidatePass(px); return; }
+  if (pc.passId == 2u) { if (restirMode) reusePass(px); return; }
   uint idx = px.y * pc.width + px.x;
+  uint cur = (pc.frame & 1u) * (pc.width * pc.height);
+  if (pc.mode == 4u) {                 // caustic channel only: no base estimator, no path tracing
+    vec3 xyz4 = vec3(0.0);
+    if (gpos[cur + idx].w > 0.5) {
+      CausticReservoir r4 = caustic[cur + idx];
+      if (r4.W > 0.0) xyz4 = r4.f.xyz * r4.W;
+    }
+    accum[idx] += vec4(xyz4, 1.0);
+    return;
+  }
 
   uint seed = pcgHash(px.x + pcgHash(px.y + pcgHash(pc.frame)));   // independent stream per (pixel, frame)
 
@@ -233,7 +324,7 @@ void main() {
 
   bool  useNEE = (pc.mode == 1u || pc.mode == 3u);
   // Caustic channel bookkeeping (mode 3): only pixels whose primary hit is the diffuse floor.
-  bool  excludeCaustic = (pc.mode == 3u) && (gpos[idx].w > 0.5);
+  bool  excludeCaustic = (pc.mode == 3u) && (gpos[cur + idx].w > 0.5);
   bool  chainFromPrimary = false;   // path since the primary diffuse vertex has only glass vertices
   int   glassCount = 0;             // glass interactions in that chain
   bool  prevSpecular = true;   // camera ray / glass: no MIS (NEE cannot generate these paths)
@@ -324,7 +415,7 @@ void main() {
     for (int i = 0; i < NUM_LAMBDA; ++i) xyz += w[i] * L[i] * xyzBar(lambda[i]);
   }
   if (excludeCaustic) {                // add the caustic channel: f(y) * W from this pixel's reservoir
-    CausticReservoir r = caustic[idx];
+    CausticReservoir r = caustic[cur + idx];
     if (r.W > 0.0) xyz += r.f.xyz * r.W;
   }
   if (any(isnan(xyz)) || any(isinf(xyz))) return;
