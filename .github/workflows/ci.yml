@@ -19,7 +19,7 @@ jobs:
 
   gpu-lavapipe:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
@@ -57,6 +57,22 @@ jobs:
           else
             echo "Negative control detected as expected"
           fi
+      - name: Caustic-channel references (mode 4, 8 candidates, no reuse)
+        run: |
+          ./build/sr_render 4 160 120 1024 build/pathtrace.spv c_ref.ppm c_ref.pfm 700000 8 0
+          ./build/sr_render 4 160 120 1024 build/pathtrace.spv c_ref2.ppm c_ref2.pfm 800000 8 0
+      - name: ReSTIR part 2a, temporal reuse (bias test on the caustic channel)
+        run: |
+          ./build/sr_render 4 160 120 1024 build/pathtrace.spv c_temporal.ppm c_temporal.pfm 900000 6 1
+          REGION_TILE=16 python3 scripts/region_bias.py c_ref.pfm c_ref2.pfm c_temporal.pfm "temporal reuse"
+      - name: ReSTIR part 2b, temporal + spatial reuse (bias test on the caustic channel)
+        if: always()
+        run: |
+          ./build/sr_render 4 160 120 1024 build/pathtrace.spv c_spatial.ppm c_spatial.pfm 1000000 2 3
+          REGION_TILE=16 python3 scripts/region_bias.py c_ref.pfm c_ref2.pfm c_spatial.pfm "temporal+spatial reuse"
+      - name: Reuse efficiency at equal path evaluations
+        if: always()
+        run: python3 scripts/restir_efficiency.py
       - name: Convergence sweep (RMSE should fall like 1/sqrt(N))
         run: python3 scripts/convergence.py
       - name: Convert images to PNG
