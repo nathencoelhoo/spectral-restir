@@ -78,7 +78,7 @@ Balance MIS costs 24 evaluations per pixel, pairwise 12.
 - Pairwise MIS halves the cost and is unbiased, but a single pass is at best break-even (0.94-1.02x).
 - A 256x192 render has roughly 0.03 floor units per pixel (my estimate); 0.01 is an 800x600 render.
 
-### 3. Iterated reuse (temporal + spatial, pairwise MIS): a real gain
+### 3. Iterated reuse in the 1D toy (SUPERSEDED: the GPU result and the 2D toy below contradict the temporal part)
 Strip of 41 pixels, 40 iterations, 2 fresh candidates + 2 spatial neighbours (radius 3) + the previous
 frame's reservoir, M capped at 20. Cost 6 evaluations per frame (temporal reuse is free in a static
 scene: p_hat is stored). Prism, caustic channel, light 1.5.
@@ -134,3 +134,72 @@ chains this means manifold walks, and dispersion makes the solution wavelength d
 - Statistics: reuse makes noise spatially correlated, which breaks the per-pixel z-test (a synthetic check
   gave a false FAIL, z = -5.95, with no bias). Reuse tests use REGION_TILE=16 (tiles as independent units).
   The tile test has less power; its real resolution is to be read off the CI tables, not assumed.
+
+### Part 2 GPU results (CI run, caustic channel only, 160x120, equal cost of 8 evaluations/pixel/frame)
+- Bias: none detected. Temporal reuse and temporal+spatial reuse pass in every region with |z| <= 1.5
+  (tile-based z-test). Standard errors were 1-3% of the signal, so only bias above roughly 2-5% is excluded.
+- Efficiency: reuse is WORSE than plain candidates. MSE ratio vs baseline: temporal 1.62 / 2.67 / 2.20 and
+  temporal+spatial 1.34 / 1.97 / 1.67 at 32 / 128 / 512 frames. (The reference has its own noise, which pulls
+  these ratios toward 1, so the true ratios at 512 frames are somewhat worse, about 2.0 and 2.8.)
+  This contradicts the 1D toy, which predicted roughly 0.4.
+
+**Diagnosis by toy (experiments/restir_iter2d_toy.cpp; 2D grid, per-frame jitter, real pixel footprints).**
+One pixel at the caustic covers (floor units, across x deep): 160x120: 0.047 x 0.165; 256x192: 0.029 x 0.102;
+800x600: 0.009 x 0.033. The 1D toy had assumed 0.03 x 0.03. Variance relative to the same-cost baseline
+(below 1 = reuse wins; 80 chains, so each ratio is uncertain by about 25%):
+
+| footprint | temporal only | temporal + spatial |
+|---|---|---|
+| 160x120, jitter on (the CI case) | 1.48 | 1.02 |
+| 160x120, jitter off | 1.51 | 0.71 |
+| isotropic 0.047 x 0.047 | 1.24 | 0.41 |
+| 800x600, jitter on | 1.37 | 0.35 |
+
+- The toy reproduces the SIGN of the GPU result at 160x120 (reuse does not win), which argues against a GPU
+  bug. The GPU is worse than the toy by up to ~2x, unexplained (toy noise alone is about 25%).
+- Temporal reuse alone loses in every case once its 2 evaluations are charged, even with jitter off.
+- Temporal+spatial wins when neighbours are close: the deep (z) direction at coarse resolution puts neighbours
+  0.165 apart. Prediction to test on the GPU: at 400x300 and above, temporal+spatial should win clearly.
+- Not diagnosed: why temporal reuse hurts. Strong temporal correlation (a sample persisting across frames)
+  is the likely reason but is not demonstrated.
+
+### Part 2 results (CI run #40) and what they mean
+
+**GPU, caustic channel only (mode 4), 160x120, equal cost of 8 path evaluations per pixel per frame.**
+MSE ratio vs the 8-candidate baseline (below 1 = reuse wins). The reference has its own noise, which
+compresses ratios toward 1, so the true ratios are somewhat further from 1 than shown.
+
+| frames | temporal (6 cand + T) | temporal + spatial (2 cand + T + 2 S) |
+|---|---|---|
+| 32 | 1.62 | 1.34 |
+| 128 | 2.67 | 1.97 |
+| 512 | 2.20 | 1.67 |
+
+Reuse was WORSE than plain candidates in this configuration, contradicting the 1D toy (which predicted
+about 0.4). Spatial-only reuse has not run on the GPU yet (added to CI after this result).
+
+**Bias (tile z-test, caustic channel).** None detected: temporal: prism +0.98% (z 0.54), near floor +0.64%
+(z 0.82), far floor -0.45% (z -0.16); temporal+spatial: +1.34% (z 0.84), -0.61% (z -0.48), +4.51% (z 1.46).
+The implied standard errors are 0.8% to 3%, so a bias below roughly 2% to 5% is NOT excluded.
+
+**2D toy with camera jitter and real pixel footprints** (experiments/restir_iter2d_toy.cpp; 100 chains,
+48 frames, ratio of frame-mean variance vs the 8-candidate baseline, +-15% noise):
+
+| footprint | temporal | temporal + spatial |
+|---|---|---|
+| 160x120 (0.047 x 0.165) | 1.24 | 0.56 |
+| isotropic 0.047 | 2.24 | 1.18 |
+| 800x600 (0.009 x 0.033) | 2.20 | 0.83 |
+
+Diagnostics at the 160x120 footprint: without camera jitter, temporal 1.35, temporal+spatial 1.04,
+spatial-only 0.56. With jitter, spatial-only 0.33.
+
+**Reading (hypotheses are marked).**
+- Camera jitter is NOT the cause of the temporal loss: it persists without jitter.
+- Temporal reuse hurt in every variant, on the GPU and in the toy. Hypothesis, untested: with M capped at 20
+  the old sample dominates the MIS weights and persists across frames, so frame-to-frame estimates are
+  strongly correlated and the mean over many frames converges slowly. Temporal reuse is built for per-frame
+  quality when not accumulating, not for converging a static image.
+- Spatial-only reuse looks good in the toy (0.33 to 0.56). The GPU has to confirm it.
+- The toy does not fully reproduce the GPU numbers for temporal + spatial (toy 0.56 to 1.18, GPU 1.3 to 2.0),
+  so a GPU-specific cause cannot be ruled out.
