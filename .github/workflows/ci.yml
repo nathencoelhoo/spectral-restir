@@ -70,9 +70,17 @@ jobs:
         run: |
           ./build/sr_render 4 160 120 1024 build/pathtrace.spv c_spatial.ppm c_spatial.pfm 1000000 2 3
           REGION_TILE=16 python3 scripts/region_bias.py c_ref.pfm c_ref2.pfm c_spatial.pfm "temporal+spatial reuse"
+      - name: ReSTIR part 2c, spatial-only reuse (bias test on the caustic channel)
+        if: always()
+        run: |
+          ./build/sr_render 4 160 120 1024 build/pathtrace.spv c_sonly.ppm c_sonly.pfm 1100000 4 2
+          REGION_TILE=16 python3 scripts/region_bias.py c_ref.pfm c_ref2.pfm c_sonly.pfm "spatial-only reuse"
       - name: Reuse efficiency at equal path evaluations
         if: always()
         run: python3 scripts/restir_efficiency.py
+      - name: Reuse efficiency at 400x300 (finer pixels, neighbours closer together)
+        if: always()
+        run: RESTIR_RES=400x300 RESTIR_SPPS=64,256 RESTIR_REF_FRAMES=512 python3 scripts/restir_efficiency.py
       - name: Convergence sweep (RMSE should fall like 1/sqrt(N))
         run: python3 scripts/convergence.py
       - name: Convert images to PNG
