@@ -1,6 +1,7 @@
 // sr_render: headless Vulkan ray-query renderer (milestone 1).
-// Usage: sr_render <mode 0=furnace|1=prism+NEE|2=prism brute-force|3=prism+NEE with ReSTIR caustic channel|4=caustic channel only>
-//                  <width> <height> <frames> <pathtrace.spv> <out.ppm> [raw.pfm|-] [frameOffset] [candidates] [reuse]
+// Usage: sr_render <mode 0=furnace|1=prism+NEE|2=prism brute-force|3=prism+NEE with ReSTIR caustic channel|4=caustic channel only|
+//                  5=prism+NEE with light-traced caustic channel|6=light-traced caustic channel only>
+//                  <width> <height> <frames> <pathtrace.spv> <out.ppm> [raw.pfm|-] [frameOffset] [candidates] [reuse] [photons]
 // reuse: bit 0 = temporal, bit 1 = spatial (modes 3/4)
 // raw.pfm holds linear-sRGB means (no tone map) for error measurement; frameOffset shifts the
 // RNG seeds so independent renders (e.g. reference vs test) never share samples.
@@ -136,7 +137,7 @@ static double yBar(double l) {
   return 0.821 * lobe(l, 568.8, 46.9, 40.5) + 0.286 * lobe(l, 530.9, 16.3, 31.1);
 }
 
-struct PC { uint32_t width, height, frame, mode, passId, cands, reuse, pad1; };   // 32 bytes, matches the shader
+struct PC { uint32_t width, height, frame, mode, passId, cands, reuse, photons; };   // 32 bytes, matches the shader
 
 int main(int argc, char** argv) {
   int mode = argc > 1 ? std::atoi(argv[1]) : 0;
@@ -147,6 +148,7 @@ int main(int argc, char** argv) {
   uint32_t frameOffset = argc > 8 ? uint32_t(std::strtoul(argv[8], nullptr, 10)) : 0;
   uint32_t cands = argc > 9 ? uint32_t(std::strtoul(argv[9], nullptr, 10)) : 4;   // ReSTIR candidates per pixel per frame
   uint32_t reuse = argc > 10 ? uint32_t(std::strtoul(argv[10], nullptr, 10)) : 0;  // reuse bits
+  uint32_t photons = argc > 11 ? uint32_t(std::strtoul(argv[11], nullptr, 10)) : 4; // photons per pixel per frame (modes 5, 6)
 
   // Instance + device
   VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.apiVersion = VK_API_VERSION_1_3;
@@ -207,6 +209,8 @@ int main(int argc, char** argv) {
   // Two slots each (ping-pong by frame parity): current frame is written, previous frame is read.
   Buf rbuf = makeBuf(VkDeviceSize(W) * H * 32 * 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT); std::memset(rbuf.map, 0, size_t(W) * H * 32 * 2);
   Buf gbuf = makeBuf(VkDeviceSize(W) * H * 16 * 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT); std::memset(gbuf.map, 0, size_t(W) * H * 16 * 2);
+  // Light-tracing splat accumulator: 3 fixed-point ints per pixel, cleared every frame by pass 3.
+  Buf sbuf = makeBuf(VkDeviceSize(W) * H * 3 * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT); std::memset(sbuf.map, 0, size_t(W) * H * 3 * 4);
 
   // Command pool
   VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -251,14 +255,14 @@ int main(int argc, char** argv) {
   VK(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE)); VK(vkQueueWaitIdle(queue));
 
   // Descriptors
-  VkDescriptorSetLayoutBinding lb[7]{};
+  VkDescriptorSetLayoutBinding lb[8]{};
   lb[0].binding = 0; lb[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
-  for (int i = 1; i < 7; ++i) { lb[i].binding = i; lb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; }
+  for (int i = 1; i < 8; ++i) { lb[i].binding = i; lb[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; }
   for (auto& b : lb) { b.descriptorCount = 1; b.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT; }
   VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-  dli.bindingCount = 7; dli.pBindings = lb;
+  dli.bindingCount = 8; dli.pBindings = lb;
   VkDescriptorSetLayout dsl; VK(vkCreateDescriptorSetLayout(gDev, &dli, nullptr, &dsl));
-  VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 6}};
+  VkDescriptorPoolSize ps[2] = {{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7}};
   VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
   dpi.maxSets = 1; dpi.poolSizeCount = 2; dpi.pPoolSizes = ps;
   VkDescriptorPool dpool; VK(vkCreateDescriptorPool(gDev, &dpi, nullptr, &dpool));
@@ -268,13 +272,13 @@ int main(int argc, char** argv) {
 
   VkWriteDescriptorSetAccelerationStructureKHR asw{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR};
   asw.accelerationStructureCount = 1; asw.pAccelerationStructures = &tlas.h;
-  VkDescriptorBufferInfo bi[6] = {{abuf.b, 0, VK_WHOLE_SIZE}, {vbuf.b, 0, VK_WHOLE_SIZE}, {ibuf.b, 0, VK_WHOLE_SIZE}, {mbuf.b, 0, VK_WHOLE_SIZE},
-                                  {rbuf.b, 0, VK_WHOLE_SIZE}, {gbuf.b, 0, VK_WHOLE_SIZE}};
-  VkWriteDescriptorSet w[7]{};
-  for (int i = 0; i < 7; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = set; w[i].dstBinding = i; w[i].descriptorCount = 1; }
+  VkDescriptorBufferInfo bi[7] = {{abuf.b, 0, VK_WHOLE_SIZE}, {vbuf.b, 0, VK_WHOLE_SIZE}, {ibuf.b, 0, VK_WHOLE_SIZE}, {mbuf.b, 0, VK_WHOLE_SIZE},
+                                  {rbuf.b, 0, VK_WHOLE_SIZE}, {gbuf.b, 0, VK_WHOLE_SIZE}, {sbuf.b, 0, VK_WHOLE_SIZE}};
+  VkWriteDescriptorSet w[8]{};
+  for (int i = 0; i < 8; ++i) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = set; w[i].dstBinding = i; w[i].descriptorCount = 1; }
   w[0].pNext = &asw; w[0].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
-  for (int i = 1; i < 7; ++i) { w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bi[i - 1]; }
-  vkUpdateDescriptorSets(gDev, 7, w, 0, nullptr);
+  for (int i = 1; i < 8; ++i) { w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[i].pBufferInfo = &bi[i - 1]; }
+  vkUpdateDescriptorSets(gDev, 8, w, 0, nullptr);
 
   // Pipeline
   std::ifstream f(spvPath, std::ios::binary | std::ios::ate);
@@ -298,7 +302,8 @@ int main(int argc, char** argv) {
     VK(vkBeginCommandBuffer(cmd, &bgi));
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &set, 0, nullptr);
-    PC pc{W, H, uint32_t(fr) + frameOffset, uint32_t(mode), 1, cands, reuse, 0};
+    PC pc{W, H, uint32_t(fr) + frameOffset, uint32_t(mode), 1, cands, reuse, photons};
+    if (mode == 5) pc.cands = 0;           // mode 5 only needs the primary-hit flag from pass 0
     auto runPass = [&](uint32_t passId) {
       pc.passId = passId;
       vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
@@ -312,6 +317,12 @@ int main(int argc, char** argv) {
     if (mode == 3 || mode == 4) {          // pass 0: candidates, pass 2: reuse (optional), pass 1: shading
       runPass(0); barrier();
       if (reuse) { runPass(2); barrier(); }
+    }
+    if (mode == 5 || mode == 6) {          // pass 3: clear splats, pass 0 (mode 5): primary hit, pass 4: photons
+      runPass(3);
+      if (mode == 5) runPass(0);
+      barrier();
+      runPass(4); barrier();
     }
     runPass(1);
     VK(vkEndCommandBuffer(cmd));
