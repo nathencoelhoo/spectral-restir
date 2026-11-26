@@ -19,7 +19,7 @@ jobs:
 
   gpu-lavapipe:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
@@ -81,6 +81,20 @@ jobs:
       - name: Reuse efficiency at 400x300 (finer pixels, neighbours closer together)
         if: always()
         run: RESTIR_RES=400x300 RESTIR_SPPS=64,256 RESTIR_REF_FRAMES=512 python3 scripts/restir_efficiency.py
+      - name: Light tracing (mode 6) bias test on the caustic channel
+        if: always()
+        run: |
+          ./build/sr_render 6 160 120 1024 build/pathtrace.spv c_lt.ppm c_lt.pfm 1200000 0 0 8
+          REGION_TILE=16 python3 scripts/region_bias.py c_ref.pfm c_ref2.pfm c_lt.pfm "light tracing"
+      - name: Light tracing efficiency at equal sample counts
+        if: always()
+        run: python3 scripts/lt_efficiency.py
+      - name: Light tracing in the full image (mode 5) vs NEE+MIS reference
+        if: always()
+        run: |
+          ./build/sr_render 5 256 192 4096 build/pathtrace.spv lt5.ppm lt5.pfm 1300000 0 0 8
+          ./build/sr_compare ref.pfm lt5.pfm 0.02
+          python3 scripts/region_bias.py ref.pfm ref2.pfm lt5.pfm "light tracing, full image"
       - name: Convergence sweep (RMSE should fall like 1/sqrt(N))
         run: python3 scripts/convergence.py
       - name: Convert images to PNG
@@ -105,7 +119,7 @@ jobs:
               png = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)) \
                     + chunk(b'IDAT', zlib.compress(raw, 9)) + chunk(b'IEND', b'')
               open(dst, 'wb').write(png)
-          for n in ('furnace', 'prism', 'ref', 'bruteforce', 'restir'):
+          for n in ('furnace', 'prism', 'ref', 'bruteforce', 'restir', 'lt5'):
               if os.path.exists(n + '.ppm'):
                   ppm_to_png(n + '.ppm', n + '.png')
           PY
@@ -120,4 +134,5 @@ jobs:
             ref.png
             bruteforce.png
             restir.png
+            lt5.png
           if-no-files-found: ignore
