@@ -36,7 +36,9 @@ python3 scripts/convergence.py                                                # 
 ```
 Modes: 0 furnace, 1 prism with NEE+MIS, 2 prism brute-force (unbiased reference for mode 1),
 3 prism with the caustic channel split out and sampled by ReSTIR (extra args: candidates, reuse bits: 1 = temporal, 2 = spatial),
-4 caustic channel only (measurement mode: no base estimator).
+4 caustic channel only (measurement mode: no base estimator),
+5 prism with the caustic channel estimated by LIGHT TRACING (extra arg after reuse: photons per pixel per frame),
+6 light-traced caustic channel only (measurement mode).
 `.pfm` files are linear sRGB; `.ppm` files are tone-mapped (ACES fit) for viewing.
 Always render the reference with a different frame offset than the test, or they share samples.
 
@@ -58,6 +60,7 @@ tools/compare.cpp         RMSE / relMSE / bias between two PFM images
 scripts/convergence.py    spp sweep + 1/sqrt(N) slope check (used by CI)
 scripts/region_bias.py    per-region (prism / floor) bias z-test; REGION_TILE=16 for correlated (reuse) noise
 scripts/restir_efficiency.py  caustic-channel noise at equal path evaluations: baseline vs temporal vs temporal+spatial
+scripts/lt_efficiency.py  light tracing vs candidates at equal sample counts and wall time
 shaders/pathtrace.comp    spectral path tracer (ray queries, hero wavelengths, dispersion)
 tests/transport_test.cpp  CPU mirror of the transport + glass furnace test
 tests/nee_test.cpp        NEE / BSDF / MIS estimators vs brute-force integration
