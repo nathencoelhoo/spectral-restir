@@ -6,7 +6,9 @@
 // Modes: 0 = furnace (glass in white environment), 1 = prism scene with NEE+MIS,
 //        2 = same scene as 1 but brute-force (no NEE): an unbiased reference to test mode 1,
 //        3 = mode 1 with the caustic channel split out and estimated by ReSTIR (candidates, optional reuse),
-//        4 = caustic channel only (measurement: no base estimator, so reuse noise can be read cleanly).
+//        4 = caustic channel only (measurement: no base estimator, so reuse noise can be read cleanly),
+//        5 = mode 1 with the caustic channel estimated by LIGHT TRACING instead of ReSTIR,
+//        6 = light-traced caustic channel only (measurement).
 //
 // Caustic channel (mode 3). For a pixel whose primary hit x is the diffuse floor, the light is split exactly:
 //   base estimate  = everything except paths  x -> 1..CAUSTIC_MAX_GLASS glass vertices -> light
@@ -42,8 +44,10 @@ layout(push_constant) uniform PC {
   uint passId;   // 0 = candidate pass (mode 3 only), 1 = shading
   uint cands;    // candidates per pixel per frame
   uint reuse;    // bit 0: temporal reuse, bit 1: spatial reuse (pass 2 runs only if nonzero)
-  uint pad1;
+  uint photons;  // photons per pixel per frame (modes 5, 6)
 } pc;
+// Light-tracing splat accumulator: 3 fixed-point ints per pixel (integer atomics; float atomics are not portable).
+layout(set = 0, binding = 7, std430) buffer Splat { int splat[]; };
 
 const uint  MAT_DIFFUSE = 0u, MAT_EMISSIVE = 1u, MAT_GLASS = 2u;
 const int   MAX_DEPTH = 32;
@@ -59,6 +63,9 @@ const float LIGHT_AREA = 9.0;
 const int   CAUSTIC_MAX_GLASS = 8;   // glass interactions handled by the caustic channel
 const float MCAP = 20.0;             // confidence cap for reused reservoirs
 const vec3  FLOOR_N = vec3(0.0, 1.0, 0.0);   // the only diffuse surface in the scene is the horizontal floor
+const vec3  PRISM_CENTER = vec3(0.0, 0.57735027, 0.0);   // bounding sphere of the prism (src/render.cpp buildScene)
+const float PRISM_R = 1.53;                                // slightly above the exact 1.5275
+const float SPLAT_SCALE = 1048576.0;                       // 2^20 fixed point
 
 vec4 lightRadiance(vec4 lambda) {
   return EMISSION * vec4(whiteLightSpectrum(lambda.x), whiteLightSpectrum(lambda.y),
@@ -183,6 +190,104 @@ vec3 evalCaustic(vec3 x, vec3 n, uint seed) {
   return vec3(0.0);
 }
 
+
+void cameraBasis(out vec3 fwd, out vec3 right, out vec3 up) {
+  fwd = normalize(vec3(0.0, 0.9, 0.0) - eyePos());
+  right = normalize(cross(fwd, vec3(0, 1, 0)));
+  up = cross(right, fwd);
+}
+
+vec3 splatXYZ(uint idx) {
+  return vec3(float(splat[3u * idx]), float(splat[3u * idx + 1u]), float(splat[3u * idx + 2u])) / SPLAT_SCALE;
+}
+
+// Light tracing for the caustic channel (mirrors experiments/light_tracing_toy.cpp): one photon from the light,
+// aimed at the prism's bounding sphere, Fresnel-sampled glass chain with its own wavelength (hero only), landing
+// on the floor, then a visibility-checked connection to the pinhole camera and a fixed-point atomic splat.
+// Counts exactly the events the base estimator skips for floor-primary pixels (1..CAUSTIC_MAX_GLASS glass vertices).
+// Splat weight: (albedo/pi) * flux * h / (z^3 * A_pix); h = eye height over the landing point, z = depth along the
+// optical axis, A_pix = pixel area on the unit-distance image plane. Radiance eta^2 factors cancel over a closed chain.
+void emitPhoton(inout uint s, float apix, float ntot) {
+  float ux = rnd(s), uz = rnd(s);
+  vec3 l = vec3(LIGHT_MIN.x + LIGHT_SIZE.x * ux, LIGHT_MIN.y - 0.002, LIGHT_MIN.z + LIGHT_SIZE.z * uz);
+  vec3 axis = PRISM_CENTER - l;
+  float D = length(axis);
+  axis /= D;
+  float ca = sqrt(max(0.0, 1.0 - (PRISM_R / D) * (PRISM_R / D)));
+  float uc = rnd(s), up2 = rnd(s);
+  float cosT = 1.0 - uc * (1.0 - ca), sinT = sqrt(max(0.0, 1.0 - cosT * cosT)), phi = 2.0 * PI * up2;
+  vec3 t1 = normalize(abs(axis.x) > 0.9 ? cross(axis, vec3(0, 1, 0)) : cross(axis, vec3(1, 0, 0)));
+  vec3 t2 = cross(axis, t1);
+  vec3 d = axis * cosT + t1 * (sinT * cos(phi)) + t2 * (sinT * sin(phi));
+  float cosL = -d.y;
+  if (cosL <= 0.0) return;
+  float pdfOm = 1.0 / (2.0 * PI * (1.0 - ca));
+  float ul = rnd(s);
+  float lam = sampleVisible(ul);
+  float pl = visiblePdf(lam);
+  if (pl <= 0.0) return;
+  float wph = EMISSION * whiteLightSpectrum(lam) * cosL * LIGHT_AREA / pdfOm / pl;   // flux carried by the photon
+
+  vec3 o = l;
+  int glass = 0;
+  bool ok = false;
+  vec3 land = vec3(0.0);
+  for (int i = 0; i <= CAUSTIC_MAX_GLASS + 1; ++i) {
+    Hit h = traceRay(o, d, 1e30);
+    if (!h.hit) return;
+    uint m = primMat[h.prim];
+    if (m == MAT_DIFFUSE) { if (glass >= 1) { land = o + d * h.t; ok = true; } break; }   // direct floor hits are not caustics
+    if (m != MAT_GLASS) return;                                                           // the light quad: photon lost
+    if (glass >= CAUSTIC_MAX_GLASS) return;
+    ++glass;
+    bool front = dot(d, h.n) < 0.0;
+    vec3 nf = front ? h.n : -h.n;
+    vec3 p = o + d * h.t;
+    float nG = sellmeierIor(GLASS_BK7, lam);
+    float eta = front ? nG : 1.0 / nG;
+    float F = fresnelDielectric(dot(-d, nf), eta);
+    float uf = rnd(s);
+    if (uf < F) { d = reflect(d, nf); o = p + nf * EPS; }
+    else        { d = normalize(refract(d, nf, 1.0 / eta)); o = p - nf * EPS; }
+  }
+  if (!ok) return;
+
+  vec3 eye = eyePos(), fwd, right, up;
+  cameraBasis(fwd, right, up);
+  vec3 v = land - eye;
+  float z = dot(v, fwd);
+  if (z <= 1e-6) return;
+  float tanHalfFov = tan(radians(40.0) * 0.5);
+  float aspect = float(pc.width) / float(pc.height);
+  float fu = dot(v, right) / z / (tanHalfFov * aspect);
+  float fv = -dot(v, up) / z / tanHalfFov;
+  float fx = (fu + 1.0) * 0.5 * float(pc.width), fy = (fv + 1.0) * 0.5 * float(pc.height);
+  if (fx < 0.0 || fy < 0.0 || fx >= float(pc.width) || fy >= float(pc.height)) return;
+  uint ix = uint(floor(fx)), iy = uint(floor(fy));
+  float dist = length(v);
+  if (occluded(eye, v / dist, dist - 1e-3)) return;                    // the camera must see the landing point
+  float hgt = eye.y - land.y;
+  float wgeom = hgt / (z * z * z * apix);
+  vec3 xyz = xyzBar(lam) * ((DIFFUSE_ALBEDO / PI) * wph * wgeom / ntot);
+  if (any(isnan(xyz)) || any(isinf(xyz))) return;
+  xyz = clamp(xyz, vec3(-1000.0), vec3(1000.0));
+  uint pix = iy * pc.width + ix;
+  vec3 q = xyz * SPLAT_SCALE;
+  atomicAdd(splat[3u * pix + 0u], int(q.x + (q.x >= 0.0 ? 0.5 : -0.5)));
+  atomicAdd(splat[3u * pix + 1u], int(q.y + (q.y >= 0.0 ? 0.5 : -0.5)));
+  atomicAdd(splat[3u * pix + 2u], int(q.z + (q.z >= 0.0 ? 0.5 : -0.5)));
+}
+
+// Pass 4: every pixel thread emits pc.photons photons (total = photons * width * height per frame).
+void photonPass(uvec2 px) {
+  uint seed = pcgHash(px.x + pcgHash(px.y + pcgHash(pc.frame ^ 0x9E3779B9u)));
+  float tanHalfFov = tan(radians(40.0) * 0.5);
+  float aspect = float(pc.width) / float(pc.height);
+  float apix = (2.0 * tanHalfFov * aspect / float(pc.width)) * (2.0 * tanHalfFov / float(pc.height));
+  float ntot = float(pc.photons) * float(pc.width) * float(pc.height);
+  for (uint i = 0u; i < pc.photons; ++i) emitPhoton(seed, apix, ntot);
+}
+
 // Pass 0: find the primary hit; if it is the diffuse floor, draw pc.cands candidate seeds and RIS-select one.
 void candidatePass(uvec2 px) {
   uint idx = px.y * pc.width + px.x;
@@ -293,10 +398,17 @@ void main() {
   uvec2 px = gl_GlobalInvocationID.xy;
   if (px.x >= pc.width || px.y >= pc.height) return;
   bool restirMode = (pc.mode == 3u || pc.mode == 4u);
-  if (pc.passId == 0u) { if (restirMode) candidatePass(px); return; }
+  bool primaryMode = restirMode || pc.mode == 5u;     // modes that need the primary-hit record from pass 0
+  if (pc.passId == 0u) { if (primaryMode) candidatePass(px); return; }
   if (pc.passId == 2u) { if (restirMode) reusePass(px); return; }
   uint idx = px.y * pc.width + px.x;
+  if (pc.passId == 3u) { splat[3u * idx] = 0; splat[3u * idx + 1u] = 0; splat[3u * idx + 2u] = 0; return; }
+  if (pc.passId == 4u) { photonPass(px); return; }
   uint cur = (pc.frame & 1u) * (pc.width * pc.height);
+  if (pc.mode == 6u) {                 // light-traced caustic channel only (measurement)
+    accum[idx] += vec4(splatXYZ(idx), 1.0);
+    return;
+  }
   if (pc.mode == 4u) {                 // caustic channel only: no base estimator, no path tracing
     vec3 xyz4 = vec3(0.0);
     if (gpos[cur + idx].w > 0.5) {
@@ -322,9 +434,9 @@ void main() {
   vec4 L = vec4(0.0);     // per-wavelength radiance
   bool heroOnly = false;  // set once a dispersive surface is hit
 
-  bool  useNEE = (pc.mode == 1u || pc.mode == 3u);
+  bool  useNEE = (pc.mode == 1u || pc.mode == 3u || pc.mode == 5u);
   // Caustic channel bookkeeping (mode 3): only pixels whose primary hit is the diffuse floor.
-  bool  excludeCaustic = (pc.mode == 3u) && (gpos[cur + idx].w > 0.5);
+  bool  excludeCaustic = (pc.mode == 3u || pc.mode == 5u) && (gpos[cur + idx].w > 0.5);
   bool  chainFromPrimary = false;   // path since the primary diffuse vertex has only glass vertices
   int   glassCount = 0;             // glass interactions in that chain
   bool  prevSpecular = true;   // camera ray / glass: no MIS (NEE cannot generate these paths)
@@ -414,10 +526,11 @@ void main() {
     vec4 w = stratifiedWeights(lambdaPdf);
     for (int i = 0; i < NUM_LAMBDA; ++i) xyz += w[i] * L[i] * xyzBar(lambda[i]);
   }
-  if (excludeCaustic) {                // add the caustic channel: f(y) * W from this pixel's reservoir
+  if (pc.mode == 3u && excludeCaustic) {   // add the caustic channel: f(y) * W from this pixel's reservoir
     CausticReservoir r = caustic[cur + idx];
     if (r.W > 0.0) xyz += r.f.xyz * r.W;
   }
+  if (pc.mode == 5u) xyz += splatXYZ(idx);   // light-traced caustic channel (all pixels; visibility is in the splat)
   if (any(isnan(xyz)) || any(isinf(xyz))) return;
 
   accum[idx] += vec4(xyz, 1.0);
