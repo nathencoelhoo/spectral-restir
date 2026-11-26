@@ -203,3 +203,41 @@ spatial-only 0.56. With jitter, spatial-only 0.33.
 - Spatial-only reuse looks good in the toy (0.33 to 0.56). The GPU has to confirm it.
 - The toy does not fully reproduce the GPU numbers for temporal + spatial (toy 0.56 to 1.18, GPU 1.3 to 2.0),
   so a GPU-specific cause cannot be ruled out.
+
+
+## Light tracing for the caustic channel (CPU toy, experiments/light_tracing_toy.cpp)
+
+Motivation: with ReSTIR the full contribution is its own target function, so resampling can only pool
+candidates, and only about 7% of camera-side candidates reach the light at all (see "Part 2 results").
+Light tracing attacks the real problem: photons start at the light, are aimed at the prism's bounding
+sphere, follow the Fresnel-sampled glass chain with their own wavelength (dispersion needs no special
+handling), land on the floor, and are splatted to the camera pixel with weight
+(albedo/pi) * flux * h / (z^3 * A_pix) (h = eye height above the landing point, z = depth along the optical
+axis, A_pix = pixel area on the unit-distance image plane), after a visibility ray from the camera.
+It estimates exactly the events the renderer's base estimator already excludes for floor-primary pixels,
+so it can replace the ReSTIR caustic channel without MIS.
+
+Single CPU core, 80x60, 8 candidates or photons per pixel per frame (toy, not the GPU):
+
+| estimator | RMSE vs guided reference, 256 frames | CPU time, 256 frames |
+|---|---|---|
+| cosine path tracing (current candidates) | 0.005619 | 1.9 s |
+| path tracing aimed at the prism | 0.004718 | 2.5 s |
+| light tracing | 0.001611 | 5.0 s |
+
+- The reference itself has noise of roughly 0.0017, so light tracing is at the reference noise floor: its
+  true advantage is larger than the numbers show. Lower bound on the MSE ratio vs cosine path tracing: about 11x
+  per sample, about 4x per CPU second (photons cost about 2.6x a candidate here).
+- Across 10 independent replicates the run-to-run spread of region means was 7% to 13% of path tracing's, i.e.
+  roughly 60x to 200x lower variance. (These replicate files were lost in a sandbox reset; the numbers come from
+  the earlier run's output.)
+- Aiming path-tracing directions at the prism gives only about 1.5x.
+
+**Bias.** None detected, at a resolution of roughly 1% to 3%. Tile z-test against two guided references
+(2048 frames each): light tracing prism -3.62% (z -1.94), near floor +1.06% (z 2.03), far floor +1.14% (z 1.90).
+Cosine path tracing, unbiased by construction, shows deviations of the same size against the same references
+(prism -1.71%, near floor -1.27% with z -2.29, far floor +2.38%), so the test cannot separate them. Global means:
+cosine path tracing 0.004278 and 0.004291, guided 0.004322 and 0.004338, light tracing 0.004342 and 0.004330.
+
+**Limits.** Prism-only: the aiming cone uses the prism's bounding sphere, the splat assumes a pinhole camera and
+a diffuse floor seen directly, and events are capped at 11 glass vertices as in the toy. Not yet on the GPU.
