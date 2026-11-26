@@ -241,3 +241,21 @@ cosine path tracing 0.004278 and 0.004291, guided 0.004322 and 0.004338, light t
 
 **Limits.** Prism-only: the aiming cone uses the prism's bounding sphere, the splat assumes a pinhole camera and
 a diffuse floor seen directly, and events are capped at 11 glass vertices as in the toy. Not yet on the GPU.
+
+
+## Light tracing on the GPU (modes 5 and 6): status
+
+**Written, awaiting CI (never compiled or run).** Design:
+- Pass 3 clears a per-pixel fixed-point accumulator (3 ints per pixel, scale 2^20; integer atomics because
+  float atomics are not portable). Pass 4: every pixel thread emits `photons` photons. Each photon: uniform point
+  on the light, direction uniform in the cone toward the prism's bounding sphere, hero wavelength from the visible
+  distribution, Fresnel-sampled glass chain (1..8 vertices, same cap as the base estimator's exclusion), landing
+  on the floor, visibility ray from the camera, splat weight (albedo/pi) * flux * h / (z^3 * A_pix).
+- Mode 6 outputs the splat alone (measurement). Mode 5 = mode 1 with the base estimator skipping the same events
+  as in mode 3 for floor-primary pixels, plus the splat for every pixel (visibility is inside the splat).
+- Scene-specific: the aiming cone uses the prism's bounding sphere (constants PRISM_CENTER and PRISM_R in the
+  shader), the camera is a pinhole, the floor is the only diffuse surface.
+- CI: bias test of mode 6 against the mode-4 references (tile z-test), efficiency vs 8 candidates at equal counts
+  (scripts/lt_efficiency.py), and a full-image check of mode 5 against the NEE+MIS references.
+- Expected from the CPU toy (not yet confirmed on the GPU): large noise reduction at equal sample counts; the toy
+  could only resolve bias at the 1% to 3% level.
