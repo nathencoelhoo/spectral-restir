@@ -63,6 +63,8 @@ tests/transport_test.cpp  CPU mirror of the transport + glass furnace test
 tests/nee_test.cpp        NEE / BSDF / MIS estimators vs brute-force integration
 tests/restir_toy_test.cpp CPU toy of ReSTIR reuse for caustic paths (unbiasedness + efficiency, see docs/DESIGN.md)
 experiments/restir_iter_toy.cpp  iterated temporal+spatial reuse experiment (not in CI)
+experiments/restir_iter2d_toy.cpp  2D / jitter variant with real pixel footprints (not in CI)
+experiments/light_tracing_toy.cpp  light tracing vs path tracing for the caustic channel (not in CI)
 shaders/spectral.glsl     HWSS, CIE fit, Sellmeier
 shaders/reservoir.glsl    80-byte spectral reservoir + update/finalize
 tests/spectral_test.cpp   CPU reference: unbiasedness + variance checks
