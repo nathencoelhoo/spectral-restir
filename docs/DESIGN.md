@@ -259,3 +259,32 @@ a diffuse floor seen directly, and events are capped at 11 glass vertices as in 
   (scripts/lt_efficiency.py), and a full-image check of mode 5 against the NEE+MIS references.
 - Expected from the CPU toy (not yet confirmed on the GPU): large noise reduction at equal sample counts; the toy
   could only resolve bias at the 1% to 3% level.
+
+
+### Light tracing: GPU results (CI run #53, lavapipe, 160x120, caustic channel, 8 photons or candidates per pixel per frame)
+
+Compiled and ran on the first build. MSE ratio vs 8 candidates (mode 4), below 1 = light tracing wins:
+
+| frames | RMSE (light tracing) | MSE ratio | wall time, candidates / photons |
+|---|---|---|---|
+| 16 | 0.006795 | 0.022 | 0.4 s / 0.9 s |
+| 64 | 0.005678 | 0.081 | 0.8 s / 2.9 s |
+| 256 | 0.005285 | 0.222 | 2.4 s / 10.5 s |
+
+- The ratios understate the advantage: light tracing's RMSE flattens near 0.0053 because the reference (8
+  candidates, 1024 frames) has its own noise of about 0.005. Correcting for that with a simple scaling
+  assumption (my estimate, not measured) gives light-tracing errors of roughly 0.004, 0.003 and 0.0017 against
+  baseline errors of 0.045, 0.019 and 0.010, i.e. an MSE advantage of tens of times per sample, and roughly
+  8x to 60x at equal wall time after dividing by the 2x to 4x photon cost.
+- Bias (tile z-test vs the mode-4 references): prism +1.15% (z 1.67), near floor +1.28% (z 2.99), far floor
+  +1.93% (z 1.47). Not flagged, all positive. The CPU toy showed the same pattern against short references
+  (near floor +1.9%, z 3.14) and it vanished against longer ones (8192 frames x2): prism -0.32% (z -0.34),
+  near floor +0.33% (z 1.68), far floor -1.04% (z -1.01); the two long path-tracing references differ from each
+  other by up to 1.05% in the prism region. So the GPU's +1.2% to +1.9% is probably reference noise too, but this
+  is not proven. The z-test is anti-conservative for heavy-tailed noise: z near 3 occurred from noise alone.
+- Full image (mode 5 vs the NEE+MIS reference, 4096 vs 8192 frames): prism -0.029% (z -0.30), near floor +0.018%
+  (z 1.43), far floor +0.009% (z 0.74). The caustic channel is only about 2% of region means, so this cannot
+  resolve a 1% bias in the caustic channel itself.
+- Open: lengthen the CI references (c_ref and c_ref2) to tighten the bias test; inspect lt5.png for splat
+  artifacts; floor seen through the prism and chains that start at a later bounce are still handled by the
+  base estimator.
