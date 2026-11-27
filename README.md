@@ -1,15 +1,23 @@
 # spectral-restir
 
-Real-time **spectral ReSTIR path tracing** in Vulkan.
+A **spectral Vulkan renderer for dispersive caustics** (a glass prism splitting light), with a statistical
+test harness, built to answer one question: *how do you get low-noise caustics through dispersive glass?*
 
-Existing real-time ReSTIR renderers resample light paths in RGB. This project
-resamples over **wavelength as part of the path**, so dispersion, prisms, gems,
-and thin films get ReSTIR-level sample reuse instead of falling back to
-brute-force spectral path tracing.
+Original idea: resample light paths with ReSTIR **over wavelength as part of the path**. What the measurements
+showed (details in docs/DESIGN.md):
+- Wavelength-carrying random replay works and is unbiased, but ReSTIR reuse gains only about 1.1x to 1.4x in MSE
+  at equal cost on this scene (spatial-only reuse; temporal reuse hurts). The target function is the full
+  contribution, so resampling can only pool candidates.
+- **Light tracing** (photons from the light, aimed at the prism, splatted to the camera) cut the caustic
+  channel's MSE by roughly 4.5x to 45x at equal sample counts on the CI runner (reported ratios; the true advantage
+  is larger because the reference's own noise sets a floor), with no bias detected at roughly 1% to 3%
+  resolution. It handles dispersion for free: each photon carries its own wavelength.
 
-> **Status: milestones 1 and 2 done; measurement harness added.**
-> CI builds everything and runs on Mesa's CPU Vulkan driver (lavapipe): furnace test,
-> NEE+MIS render, a bias check against brute-force path tracing, and a convergence sweep.
+> **Status.** Spectral path tracer (hero wavelengths, Sellmeier dispersion), NEE+MIS, ReSTIR caustic channel
+> (modes 3/4) and light-traced caustic channel (modes 5/6), all verified in CI on Mesa's CPU Vulkan driver
+> (lavapipe) against brute-force references with a per-region bias test. Caveats: the scene is one prism, one
+> floor, one area light and a pinhole camera; bias is excluded only down to about 1% to 3% per region; photons
+> cost 2x to 4x a candidate on the CI runner (software Vulkan, indicative).
 
 ## Related work (read before claiming novelty)
 - Waseda thesis proposing resampling for spectral path tracing (offline-oriented)
